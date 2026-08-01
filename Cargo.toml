@@ -1,0 +1,31 @@
+[package]
+name = "nirimap"
+version = "0.1.0"
+edition = "2021"
+description = "A lightweight, low-resource minimap overlay for the Niri Wayland compositor"
+license = "MIT"
+repository = "https://github.com/your-name/nirimap"
+
+[dependencies]
+anyhow = "1"
+calloop = "0.13"
+calloop-wayland-source = "0.3"
+dirs = "6"
+env_logger = "0.11"
+libc = "0.2"
+log = "0.4"
+memmap2 = "0.9"
+niri-ipc = "26"
+notify = "8"
+serde = { version = "1", features = ["derive"] }
+tiny-skia = "0.11"
+toml = "0.8"
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
