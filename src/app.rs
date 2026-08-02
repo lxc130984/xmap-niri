@@ -19,8 +19,8 @@ use wayland_client::protocol::{
     wl_callback::{self, WlCallback},
     wl_compositor::{self, WlCompositor},
     wl_output::{self, WlOutput},
-    wl_registry::{self, WlRegistry},
     wl_region::{self, WlRegion},
+    wl_registry::{self, WlRegistry},
     wl_shm::{self, Format, WlShm},
     wl_shm_pool::{self, WlShmPool},
     wl_surface::{self, WlSurface},
@@ -28,12 +28,11 @@ use wayland_client::protocol::{
 use wayland_client::{delegate_noop, Dispatch, Proxy, QueueHandle};
 use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_shell_v1::{self, Layer, ZwlrLayerShellV1},
-    zwlr_layer_surface_v1::{
-        self, Anchor, KeyboardInteractivity, ZwlrLayerSurfaceV1,
-    },
+    zwlr_layer_surface_v1::{self, Anchor, KeyboardInteractivity, ZwlrLayerSurfaceV1},
 };
 
 use crate::config::Config;
+use crate::icons::SharedIcons;
 use crate::ipc::{Shared, UiMsg};
 use crate::{layout, render};
 
@@ -50,6 +49,7 @@ pub struct App {
 
     shared: Shared,
     config: Arc<RwLock<Config>>,
+    icons: SharedIcons,
 
     buffers: Vec<ShmBuffer>,
     next_buffer_id: u64,
@@ -103,7 +103,15 @@ impl ShmBuffer {
         file.set_len(size as u64)?;
         let mmap = unsafe { MmapMut::map_mut(&file) }?;
         let pool = shm.create_pool(file.as_fd(), size as i32, qh, ());
-        let buffer = pool.create_buffer(0, w as i32, h as i32, (w * 4) as i32, Format::Argb8888, qh, ());
+        let buffer = pool.create_buffer(
+            0,
+            w as i32,
+            h as i32,
+            (w * 4) as i32,
+            Format::Argb8888,
+            qh,
+            (),
+        );
         Ok(ShmBuffer {
             id,
             _file: file,
@@ -132,10 +140,12 @@ impl App {
         qh: &QueueHandle<App>,
         shared: Shared,
         config: Arc<RwLock<Config>>,
+        icons: SharedIcons,
     ) -> Result<Self> {
         let compositor = globals.bind::<WlCompositor, _, _>(qh, 1..=4, ())?;
         let shm = globals.bind::<WlShm, _, _>(qh, 1..=1, ())?;
         let layer_shell = globals.bind::<ZwlrLayerShellV1, _, _>(qh, 1..=1, ())?;
+        log::info!("bound wl_compositor, wl_shm and zwlr_layer_shell_v1");
         let visible = config
             .read()
             .unwrap_or_else(|e| e.into_inner())
@@ -151,6 +161,7 @@ impl App {
             overlay: None,
             shared,
             config,
+            icons,
             buffers: Vec::new(),
             next_buffer_id: 1,
             visible,
@@ -174,9 +185,12 @@ impl App {
         globals.contents().with_list(|list| {
             for g in list {
                 if g.interface == "wl_output" {
-                    let proxy = globals
-                        .registry()
-                        .bind::<WlOutput, _, _>(g.name, g.version.min(4), &self.qh, ());
+                    let proxy = globals.registry().bind::<WlOutput, _, _>(
+                        g.name,
+                        g.version.min(4),
+                        &self.qh,
+                        (),
+                    );
                     self.outputs.push(OutputInfo {
                         registry_name: g.name,
                         name: None,
@@ -232,7 +246,11 @@ impl App {
         let Ok(new) = Config::load() else {
             return;
         };
-        let old = self.config.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let old = self
+            .config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         *self.config.write().unwrap_or_else(|e| e.into_inner()) = new.clone();
 
         if new.display.anchor != old.display.anchor
@@ -296,6 +314,13 @@ impl App {
         region.add(0, 0, 0, 0);
 
         let output = self.focused_output_proxy();
+        log::info!(
+            "creating layer surface (namespace=nirimap, output={})",
+            output
+                .as_ref()
+                .map(|o| format!("{:?}", o.id()))
+                .unwrap_or_else(|| "all".into())
+        );
         let layer = self.layer_shell.get_layer_surface(
             &surface,
             output.as_ref(),
@@ -324,6 +349,7 @@ impl App {
             region,
             output,
         });
+        log::info!("layer surface created; requesting size");
         self.update_surface_scale();
         surface.set_buffer_scale(self.surface_scale.max(1));
         // First commit without a buffer: the compositor replies with a
@@ -366,7 +392,11 @@ impl App {
     }
 
     fn update_surface_scale(&mut self) {
-        let overlay_output = self.overlay.as_ref().and_then(|o| o.output.as_ref()).map(|p| p.id());
+        let overlay_output = self
+            .overlay
+            .as_ref()
+            .and_then(|o| o.output.as_ref())
+            .map(|p| p.id());
         let scale = self
             .outputs
             .iter()
@@ -390,6 +420,7 @@ impl App {
 
     fn compute_desired_size(&self) -> (u32, u32) {
         let cfg = self.config.read().unwrap_or_else(|e| e.into_inner());
+        let show_icons = cfg.appearance.show_icons;
         let height = cfg.display.height.clamp(8, 2048);
         let max_w = (self.viewport_width * cfg.display.max_width_percent as f32)
             .clamp(8.0, self.viewport_width)
@@ -413,22 +444,39 @@ impl App {
             let mut left = f32::INFINITY;
             let mut right = f32::NEG_INFINITY;
             for ws in &ws_list {
-                let row = layout::build_row(ws, &shared.state.windows.windows);
+                let row = layout::build_row(
+                    ws,
+                    &shared.state.windows.windows,
+                    show_icons.then_some(&self.icons),
+                );
                 if row.has_content() {
                     global_max = global_max.max(row.max_height as f32);
                     left = left.min(-row.align_x as f32);
                     right = right.max((row.total_width - row.align_x) as f32);
                 }
             }
-            let k = if global_max > 0.0 { row_h / global_max } else { 0.0 };
-            let content_w = if left.is_finite() { (right - left) * k } else { 0.0 };
+            let k = if global_max > 0.0 {
+                row_h / global_max
+            } else {
+                0.0
+            };
+            let content_w = if left.is_finite() {
+                (right - left) * k
+            } else {
+                0.0
+            };
             let w = (content_w + 2.0 * render::PADDING)
                 .max(height as f32)
                 .min(max_w);
             (w as u32, h as u32)
         } else {
-            let focused = layout::focused_workspace(&shared.state)
-                .map(|ws| layout::build_row(ws, &shared.state.windows.windows));
+            let focused = layout::focused_workspace(&shared.state).map(|ws| {
+                layout::build_row(
+                    ws,
+                    &shared.state.windows.windows,
+                    show_icons.then_some(&self.icons),
+                )
+            });
             let mut w = height as f32;
             if let Some(row) = focused {
                 if row.max_height > 0.0 {
@@ -493,7 +541,13 @@ impl App {
                 let ws_list = layout::all_rows(&shared.state);
                 built = ws_list
                     .iter()
-                    .map(|ws| layout::build_row(ws, &shared.state.windows.windows))
+                    .map(|ws| {
+                        layout::build_row(
+                            ws,
+                            &shared.state.windows.windows,
+                            appearance.show_icons.then_some(&self.icons),
+                        )
+                    })
                     .collect();
                 rows = built
                     .iter()
@@ -506,8 +560,13 @@ impl App {
                 focused = None;
             } else {
                 rows = Vec::new();
-                focused = layout::focused_workspace(&shared.state)
-                    .map(|ws| layout::build_row(ws, &shared.state.windows.windows));
+                focused = layout::focused_workspace(&shared.state).map(|ws| {
+                    layout::build_row(
+                        ws,
+                        &shared.state.windows.windows,
+                        appearance.show_icons.then_some(&self.icons),
+                    )
+                });
             }
         }
 
@@ -520,12 +579,15 @@ impl App {
             focused.as_ref(),
             &rows,
             viewport_w,
+            &self.icons,
+            appearance.show_icons,
         ) else {
             warn!("failed to allocate render pixmap");
             return;
         };
 
         if let Some(buf) = self.acquire_buffer(phys_w, phys_h) {
+            log::debug!("attaching buffer {phys_w}x{phys_h}");
             let dst = &mut buf.mmap[..data.len()];
             dst.copy_from_slice(&data);
             let buffer = buf.buffer.clone();
@@ -538,6 +600,7 @@ impl App {
             let cb = surface.frame(&self.qh, ());
             self.frame_cb = Some(cb);
             surface.commit();
+            log::debug!("buffer committed");
         } else {
             // All buffers are with the compositor; stay dirty and let a
             // release event trigger the redraw.
@@ -546,7 +609,11 @@ impl App {
     }
 
     fn acquire_buffer(&mut self, w: u32, h: u32) -> Option<&mut ShmBuffer> {
-        if let Some(i) = self.buffers.iter().position(|b| !b.in_use && b.w == w && b.h == h) {
+        if let Some(i) = self
+            .buffers
+            .iter()
+            .position(|b| !b.in_use && b.w == w && b.h == h)
+        {
             let b = &mut self.buffers[i];
             b.in_use = true;
             return Some(b);
@@ -596,6 +663,7 @@ impl App {
     fn on_configure(&mut self, w: u32, h: u32) {
         self.configured = Some((w.max(1), h.max(1)));
         self.size_pending = false;
+        log::debug!("configure received: {w}x{h}");
         if self.visible {
             self.dirty = true;
         }
@@ -603,12 +671,17 @@ impl App {
     }
 
     fn on_frame_done(&mut self) {
+        log::debug!("frame callback done");
         self.frame_cb = None;
         self.pump();
     }
 
     fn on_buffer_release(&mut self, proxy: &WlBuffer) {
-        if let Some(b) = self.buffers.iter_mut().find(|b| b.buffer.id() == proxy.id()) {
+        if let Some(b) = self
+            .buffers
+            .iter_mut()
+            .find(|b| b.buffer.id() == proxy.id())
+        {
             b.in_use = false;
         }
         if self.dirty {
@@ -627,7 +700,11 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for App {
         qh: &QueueHandle<Self>,
     ) {
         match event {
-            wl_registry::Event::Global { name, interface, version } => {
+            wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } => {
                 if interface == "wl_output" {
                     let proxy = registry.bind::<WlOutput, _, _>(name, version.min(4), qh, ());
                     state.outputs.push(OutputInfo {
@@ -658,7 +735,11 @@ impl Dispatch<wl_output::WlOutput, ()> for App {
     ) {
         match event {
             wl_output::Event::Scale { factor } => {
-                if let Some(o) = state.outputs.iter_mut().find(|o| o.proxy.id() == proxy.id()) {
+                if let Some(o) = state
+                    .outputs
+                    .iter_mut()
+                    .find(|o| o.proxy.id() == proxy.id())
+                {
                     o.scale = factor;
                 }
                 state.update_surface_scale();
@@ -668,7 +749,11 @@ impl Dispatch<wl_output::WlOutput, ()> for App {
                 }
             }
             wl_output::Event::Name { name } => {
-                if let Some(o) = state.outputs.iter_mut().find(|o| o.proxy.id() == proxy.id()) {
+                if let Some(o) = state
+                    .outputs
+                    .iter_mut()
+                    .find(|o| o.proxy.id() == proxy.id())
+                {
                     o.name = Some(name.clone());
                 }
                 let focused = state.focused_output_name.clone();
@@ -746,7 +831,11 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for App {
         _: &QueueHandle<Self>,
     ) {
         match event {
-            zwlr_layer_surface_v1::Event::Configure { serial, width, height } => {
+            zwlr_layer_surface_v1::Event::Configure {
+                serial,
+                width,
+                height,
+            } => {
                 proxy.ack_configure(serial);
                 state.on_configure(width, height);
             }

@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use niri_ipc::state::EventStreamState;
 use niri_ipc::{Window, Workspace};
 
+use crate::icons::{self, SharedIcons};
+
 /// One tiled window tile in workspace coordinates (logical pixels).
 #[derive(Debug, Clone)]
 pub struct Tile {
@@ -13,6 +15,8 @@ pub struct Tile {
     pub w: f64,
     pub h: f64,
     pub focused: bool,
+    /// Wayland app_id used to resolve the desktop icon.
+    pub app_id: Option<String>,
 }
 
 /// A workspace laid out in its own coordinate space.
@@ -69,13 +73,21 @@ pub fn all_rows(state: &EventStreamState) -> Vec<&Workspace> {
 /// relative layout is fully known. Floating windows are excluded: niri only
 /// reports their position while they happen to be inside the viewport, so they
 /// cannot be placed reliably.
-pub fn build_row(ws: &Workspace, windows: &HashMap<u64, Window>) -> Row {
+///
+/// When `icons` is given (icon mode), windows whose app_id has no resolvable
+/// icon are skipped, so the row geometry already reflects what will be drawn.
+pub fn build_row(
+    ws: &Workspace,
+    windows: &HashMap<u64, Window>,
+    icons: Option<&SharedIcons>,
+) -> Row {
     struct Entry {
         idx: usize,
         w: f64,
         h: f64,
         view_pos: Option<(f64, f64)>,
         focused: bool,
+        app_id: Option<String>,
     }
 
     let mut columns: std::collections::BTreeMap<usize, Vec<Entry>> =
@@ -83,6 +95,15 @@ pub fn build_row(ws: &Workspace, windows: &HashMap<u64, Window>) -> Row {
     for win in windows.values() {
         if win.workspace_id != Some(ws.id) {
             continue;
+        }
+        if let Some(icons) = icons {
+            if !win
+                .app_id
+                .as_deref()
+                .is_some_and(|id| icons::has_icon(icons, id))
+            {
+                continue;
+            }
         }
         let Some((col, tile)) = win.layout.pos_in_scrolling_layout else {
             continue; // floating or otherwise unpositioned
@@ -96,6 +117,7 @@ pub fn build_row(ws: &Workspace, windows: &HashMap<u64, Window>) -> Row {
             h: win.layout.tile_size.1,
             view_pos: win.layout.tile_pos_in_workspace_view,
             focused: win.is_focused,
+            app_id: win.app_id.clone(),
         });
     }
 
@@ -114,6 +136,7 @@ pub fn build_row(ws: &Workspace, windows: &HashMap<u64, Window>) -> Row {
                 w: e.w,
                 h: e.h,
                 focused: e.focused,
+                app_id: e.app_id.clone(),
             });
             // This window's tile is at viewport-x `e.view_pos.0`, while its
             // workspace-x is the current column's start. The difference is the

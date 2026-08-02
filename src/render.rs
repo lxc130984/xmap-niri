@@ -1,11 +1,10 @@
 //! CPU rendering of the minimap into a premultiplied BGRA8888 buffer
 //! (wl_shm ARGB8888 byte order).
 
-use tiny_skia::{
-    Color, FillRule, Paint, Path, PathBuilder, Pixmap, Rect, Stroke, Transform,
-};
+use tiny_skia::{Color, FillRule, Paint, Path, PathBuilder, Pixmap, Rect, Stroke, Transform};
 
 use crate::config::{parse_hex, AppearanceConfig};
+use crate::icons::{self, draw_icon, SharedIcons};
 use crate::layout::Row;
 
 /// Padding around the content inside the widget, logical pixels.
@@ -32,6 +31,8 @@ pub fn render(
     focused: Option<&Row>,
     rows: &[RowView<'_>],
     viewport_width: f32,
+    icons: &SharedIcons,
+    show_icons: bool,
 ) -> Option<Vec<u8>> {
     let mut pixmap = Pixmap::new(phys_w, phys_h)?;
     let s = Transform::from_scale(scale, scale);
@@ -42,15 +43,37 @@ pub fn render(
         if let Some((r, g, b)) = parse_hex(&cfg.background) {
             let mut paint = Paint::default();
             set_paint_color(&mut paint, r, g, b, cfg.background_opacity as f32);
-            let path = rounded_rect(Rect::from_xywh(0.0, 0.0, log_w, log_h)?, cfg.border_radius as f32);
+            let path = rounded_rect(
+                Rect::from_xywh(0.0, 0.0, log_w, log_h)?,
+                cfg.border_radius as f32,
+            );
             pixmap.fill_path(&path, &paint, FillRule::Winding, s, None);
         }
     }
 
     if mode == "all" {
-        draw_all(&mut pixmap, s, cfg, rows, log_w, log_h, viewport_width);
+        draw_all(
+            &mut pixmap,
+            s,
+            cfg,
+            rows,
+            log_w,
+            log_h,
+            viewport_width,
+            icons,
+            show_icons,
+        );
     } else {
-        draw_current(&mut pixmap, s, cfg, focused, log_w, log_h);
+        draw_current(
+            &mut pixmap,
+            s,
+            cfg,
+            focused,
+            log_w,
+            log_h,
+            icons,
+            show_icons,
+        );
     }
 
     // tiny-skia is RGBA; wl_shm ARGB8888 wants BGRA.
@@ -61,6 +84,7 @@ pub fn render(
     Some(data)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_current(
     pix: &mut Pixmap,
     s: Transform,
@@ -68,6 +92,8 @@ fn draw_current(
     focused: Option<&Row>,
     log_w: f32,
     log_h: f32,
+    icons: &SharedIcons,
+    show_icons: bool,
 ) {
     let Some(row) = focused else { return };
     if !row.has_content() {
@@ -92,10 +118,14 @@ fn draw_current(
             t.h as f32 * k,
             t.focused,
             None,
+            icons,
+            t.app_id.as_deref(),
+            show_icons,
         );
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_all(
     pix: &mut Pixmap,
     s: Transform,
@@ -104,6 +134,8 @@ fn draw_all(
     log_w: f32,
     log_h: f32,
     viewport_width: f32,
+    icons: &SharedIcons,
+    show_icons: bool,
 ) {
     if rows.is_empty() {
         return;
@@ -181,6 +213,9 @@ fn draw_all(
                     t.h as f32 * k,
                     t.focused,
                     Some(clip),
+                    icons,
+                    t.app_id.as_deref(),
+                    show_icons,
                 );
             }
         }
@@ -199,10 +234,17 @@ fn draw_tile(
     h: f32,
     focused: bool,
     clip: Option<Rect>,
+    icons: &SharedIcons,
+    app_id: Option<&str>,
+    show_icons: bool,
 ) {
     let gap = (cfg.gap as f32) * 0.5;
-    let (mut x, mut y, mut w, mut h) =
-        (x + gap, y + gap, (w - gap * 2.0).max(1.0), (h - gap * 2.0).max(1.0));
+    let (mut x, mut y, mut w, mut h) = (
+        x + gap,
+        y + gap,
+        (w - gap * 2.0).max(1.0),
+        (h - gap * 2.0).max(1.0),
+    );
     if let Some(c) = clip {
         // Cheap rect clipping instead of a full mask: the "clip" is always a
         // plain rectangle here, so intersect before rasterizing.
@@ -252,6 +294,27 @@ fn draw_tile(
             );
         }
     }
+
+    if show_icons {
+        if let Some(app_id) = app_id {
+            icons::with_icon(icons, app_id, |icon| {
+                if let Some(icon) = icon {
+                    draw_icon(pix, icon, scale_of(s), x, y, w, h);
+                }
+            });
+        }
+    }
+}
+
+/// Uniform scale factor of the widget's buffer transform.
+fn scale_of(s: Transform) -> f32 {
+    // The transform is always `from_scale(n, n)`; fall back to 1.0 defensively.
+    let (_, sy) = s.get_scale();
+    if sy > 0.0 {
+        sy
+    } else {
+        1.0
+    }
 }
 
 fn set_paint_color(paint: &mut Paint, r: f32, g: f32, b: f32, a: f32) {
@@ -266,7 +329,10 @@ fn rect_min(x: f32, y: f32, w: f32, h: f32) -> Rect {
 }
 
 fn rounded_rect(rect: Rect, radius: f32) -> Path {
-    let r = radius.min(rect.width() / 2.0).min(rect.height() / 2.0).max(0.0);
+    let r = radius
+        .min(rect.width() / 2.0)
+        .min(rect.height() / 2.0)
+        .max(0.0);
     let (x, y, w, h) = (rect.left(), rect.top(), rect.width(), rect.height());
     let mut pb = PathBuilder::new();
     if r <= 0.001 {
@@ -284,4 +350,101 @@ fn rounded_rect(rect: Rect, radius: f32) -> Path {
     }
     pb.close();
     pb.finish().unwrap_or_else(|| PathBuilder::from_rect(rect))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AppearanceConfig, Config};
+    use crate::icons::IconCache;
+    use crate::ipc::Snapshot;
+    use crate::layout;
+    use niri_ipc::{Window, WindowLayout, Workspace};
+    use std::sync::{Arc, Mutex};
+
+    fn test_window(id: u64, col: usize, tile: usize, w: f64, h: f64) -> Window {
+        Window {
+            id,
+            title: Some(format!("win{id}")),
+            app_id: Some("test".into()),
+            pid: None,
+            workspace_id: Some(1),
+            is_focused: false,
+            is_floating: false,
+            is_urgent: false,
+            layout: WindowLayout {
+                pos_in_scrolling_layout: Some((col, tile)),
+                tile_size: (w, h),
+                window_size: (w as i32, h as i32),
+                tile_pos_in_workspace_view: Some((0.0, 0.0)),
+                window_offset_in_tile: (0.0, 0.0),
+            },
+            focus_timestamp: None,
+        }
+    }
+
+    #[test]
+    fn renders_pixels_for_tiled_windows() {
+        let mut snap = Snapshot::default();
+        snap.state.workspaces.workspaces.insert(
+            1,
+            Workspace {
+                id: 1,
+                idx: 0,
+                name: Some("1".into()),
+                output: Some("eDP-1".into()),
+                is_active: true,
+                is_focused: true,
+                is_urgent: false,
+                active_window_id: Some(10),
+            },
+        );
+        snap.state
+            .windows
+            .windows
+            .insert(10, test_window(10, 1, 1, 800.0, 600.0));
+        snap.state
+            .windows
+            .windows
+            .insert(11, test_window(11, 1, 2, 800.0, 400.0));
+
+        let ws = snap.state.workspaces.workspaces.get(&1).unwrap();
+        let row = layout::build_row(ws, &snap.state.windows.windows, None);
+        assert!(row.has_content());
+        assert_eq!(row.tiles.len(), 2);
+
+        let cfg = Config::default();
+        let icons = Arc::new(Mutex::new(IconCache::default()));
+        let data = render(
+            200,
+            200,
+            1.0,
+            &cfg.appearance,
+            "current",
+            Some(&row),
+            &[],
+            1920.0,
+            &icons,
+            false,
+        )
+        .expect("render should succeed");
+        assert_eq!(data.len(), 200 * 200 * 4);
+        // With show_icons=false, tiles draw colored rects: at least one pixel
+        // must be non-transparent.
+        assert!(data.chunks_exact(4).any(|px| px[3] != 0));
+
+        // Icon mode with an unresolvable app_id filters the row to empty.
+        let row = layout::build_row(ws, &snap.state.windows.windows, Some(&icons));
+        assert!(!row.has_content());
+    }
+
+    #[test]
+    fn appearance_defaults_are_sane() {
+        let a = AppearanceConfig::default();
+        assert!(a.show_icons);
+        assert_eq!(
+            parse_hex(&a.window_color),
+            Some((69.0 / 255.0, 71.0 / 255.0, 90.0 / 255.0))
+        );
+    }
 }

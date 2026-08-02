@@ -40,7 +40,7 @@ pub struct DisplayConfig {
     pub follow_focus: bool,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AppearanceConfig {
     pub background: String,
@@ -53,9 +53,34 @@ pub struct AppearanceConfig {
     pub gap: f64,
     pub window_opacity: f64,
     pub focused_opacity: f64,
+    /// Draw the application's desktop icon in each window tile instead of a
+    /// plain rectangle. Windows without a resolvable icon are skipped.
+    #[serde(default = "default_true")]
+    pub show_icons: bool,
     pub workspace_gap: f64,
     pub active_workspace_border_color: String,
     pub active_workspace_border_width: f64,
+}
+
+impl Default for AppearanceConfig {
+    fn default() -> Self {
+        Self {
+            background: "#1e1e2e".into(),
+            background_opacity: 0.0,
+            window_color: "#45475a".into(),
+            focused_color: "#89b4fa".into(),
+            border_color: "#6c7086".into(),
+            border_width: 1.0,
+            border_radius: 2.0,
+            gap: 2.0,
+            window_opacity: 0.7,
+            focused_opacity: 1.0,
+            show_icons: true,
+            workspace_gap: 4.0,
+            active_workspace_border_color: "#89b4fa".into(),
+            active_workspace_border_width: 2.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -80,19 +105,7 @@ impl Default for Config {
                 follow_focus: true,
             },
             appearance: AppearanceConfig {
-                background: "#1e1e2e".into(),
-                background_opacity: 0.0,
-                window_color: "#45475a".into(),
-                focused_color: "#89b4fa".into(),
-                border_color: "#6c7086".into(),
-                border_width: 1.0,
-                border_radius: 2.0,
-                gap: 2.0,
-                window_opacity: 0.7,
-                focused_opacity: 1.0,
-                workspace_gap: 4.0,
-                active_workspace_border_color: "#89b4fa".into(),
-                active_workspace_border_width: 2.0,
+                ..AppearanceConfig::default()
             },
             behavior: BehaviorConfig {
                 always_visible: true,
@@ -145,21 +158,20 @@ pub fn spawn_config_watcher(path: &Path, tx: Sender<UiMsg>) -> Result<()> {
     thread::Builder::new()
         .name("nirimap-config".into())
         .spawn(move || {
-            let mut watcher = match notify::recommended_watcher(
-                move |res: notify::Result<notify::Event>| {
+            let mut watcher =
+                match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
                     if let Ok(ev) = res {
                         if ev.paths.iter().any(|p| p == &path) {
                             tx.send(UiMsg::ConfigReload).ok();
                         }
                     }
-                },
-            ) {
-                Ok(w) => w,
-                Err(err) => {
-                    warn!("failed to start config watcher: {err}");
-                    return;
-                }
-            };
+                }) {
+                    Ok(w) => w,
+                    Err(err) => {
+                        warn!("failed to start config watcher: {err}");
+                        return;
+                    }
+                };
             if let Err(err) = watcher.watch(&parent, RecursiveMode::NonRecursive) {
                 warn!("failed to watch config directory: {err}");
                 return;
@@ -183,6 +195,10 @@ pub fn parse_hex(s: &str) -> Option<(f32, f32, f32)> {
         ((v >> 8) & 0xff) as f32 / 255.0,
         (v & 0xff) as f32 / 255.0,
     ))
+}
+
+fn default_true() -> bool {
+    true
 }
 
 const DEFAULT_CONFIG: &str = r##"# nirimap configuration
@@ -215,6 +231,7 @@ border_radius = 2
 gap = 2
 window_opacity = 0.7
 focused_opacity = 1.0
+show_icons = true
 workspace_gap = 4
 active_workspace_border_color = "#89b4fa"
 active_workspace_border_width = 2

@@ -17,6 +17,7 @@ log = "0.4"
 memmap2 = "0.9"
 niri-ipc = "26"
 notify = "8"
+resvg = { version = "0.45", default-features = false, features = ["text"] }
 serde = { version = "1", features = ["derive"] }
 tiny-skia = "0.11"
 toml = "0.8"

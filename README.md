@@ -15,6 +15,9 @@ rest of the time.
   - `all` — stack every non-empty workspace, one row each.
 - Follows the focused output, tracks output scale and window positions in real
   time through the niri IPC event stream.
+- **Desktop icons**: window tiles can show the app's .desktop icon (PNG or
+  SVG) instead of a plain rectangle; windows without a resolvable icon are
+  skipped. Icons are resolved lazily once per app and cached.
 - Fully CPU-side rendering with tiny-skia; no GPU context, no shaders.
 - Event-driven redraws paced by compositor frame callbacks — bursts of niri
   events cost at most one repaint per display frame.
@@ -29,6 +32,9 @@ rest of the time.
   `wl_buffer.release` returns them to the pool instead of reallocating.
 - **No per-frame allocation in the hot path.** Rows are built from the niri
   event state and rasterized with tiny-skia directly into the buffer.
+- **Icon lookup is cached.** Each `app_id` is resolved at most once (misses
+  included), off the render thread; steady-state drawing is one hash lookup
+  and a small scaled blit per window.
 - **One IPC thread, one UI thread.** No polling loops; niri pushes state
   changes over its socket, and the UI thread only wakes on real events.
 - **Idle by default:** when hidden, the surface is detached and all buffers
@@ -67,6 +73,7 @@ background = "#1e1e2e"
 window_color = "#45475a"
 focused_color = "#89b4fa"
 window_opacity = 0.7
+show_icons = true        # draw .desktop icons in tiles; skip icon-less windows
 
 [behavior]
 always_visible = true
@@ -81,6 +88,8 @@ hide_timeout_ms = 2000  # only used when always_visible = false
   using each tiled window's column/tile position.
 - `src/render.rs` — tiny-skia rasterization (RGBA) with a final BGR(A) byte
   swap for `wl_shm` ARGB8888.
+- `src/icons.rs` — lazy .desktop icon resolution (PNG via tiny-skia, SVG via
+  resvg) with a shared cache.
 - `src/app.rs` — the layer-shell surface, shm buffer pool, and frame-callback
   pacing.
 
