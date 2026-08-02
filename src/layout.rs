@@ -15,6 +15,8 @@ pub struct Tile {
     pub w: f64,
     pub h: f64,
     pub focused: bool,
+    /// The workspace's last-focused (active) window.
+    pub is_last_focused: bool,
     /// Wayland app_id used to resolve the desktop icon.
     pub app_id: Option<String>,
 }
@@ -27,8 +29,6 @@ pub struct Row {
     pub total_width: f64,
     /// Tallest column height.
     pub max_height: f64,
-    /// Viewport offset: workspace-x of the viewport's left edge.
-    pub align_x: f64,
 }
 
 impl Row {
@@ -82,10 +82,10 @@ pub fn build_row(
     icons: Option<&SharedIcons>,
 ) -> Row {
     struct Entry {
+        id: u64,
         idx: usize,
         w: f64,
         h: f64,
-        view_pos: Option<(f64, f64)>,
         focused: bool,
         app_id: Option<String>,
     }
@@ -112,17 +112,17 @@ pub fn build_row(
             continue; // 1-based indices; ignore malformed values
         }
         columns.entry(col - 1).or_default().push(Entry {
+            id: win.id,
             idx: tile - 1,
             w: win.layout.tile_size.0,
             h: win.layout.tile_size.1,
-            view_pos: win.layout.tile_pos_in_workspace_view,
             focused: win.is_focused,
             app_id: win.app_id.clone(),
         });
     }
 
     let mut row = Row::default();
-    let mut align_x: Option<f64> = None;
+    let active = ws.active_window_id;
     let mut x = 0.0;
 
     for (col_idx, mut col) in columns.into_iter() {
@@ -136,14 +136,9 @@ pub fn build_row(
                 w: e.w,
                 h: e.h,
                 focused: e.focused,
+                is_last_focused: active == Some(e.id) || (active.is_none() && e.focused),
                 app_id: e.app_id.clone(),
             });
-            // This window's tile is at viewport-x `e.view_pos.0`, while its
-            // workspace-x is the current column's start. The difference is the
-            // viewport offset. (col_idx unused; x already holds the offset.)
-            if let Some((px, _)) = e.view_pos {
-                align_x.get_or_insert(x - px);
-            }
             y += e.h;
         }
         row.max_height = row.max_height.max(y);
@@ -152,6 +147,5 @@ pub fn build_row(
     }
 
     row.total_width = x;
-    row.align_x = align_x.unwrap_or(0.0);
     row
 }

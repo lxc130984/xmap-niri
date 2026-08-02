@@ -441,8 +441,7 @@ impl App {
             let row_h = (h - 2.0 * render::PADDING - (n - 1.0) * gap) / n;
 
             let mut global_max = 0.0_f32;
-            let mut left = f32::INFINITY;
-            let mut right = f32::NEG_INFINITY;
+            let mut max_width = 0.0_f64;
             for ws in &ws_list {
                 let row = layout::build_row(
                     ws,
@@ -451,8 +450,7 @@ impl App {
                 );
                 if row.has_content() {
                     global_max = global_max.max(row.max_height as f32);
-                    left = left.min(-row.align_x as f32);
-                    right = right.max((row.total_width - row.align_x) as f32);
+                    max_width = max_width.max(row.total_width);
                 }
             }
             let k = if global_max > 0.0 {
@@ -460,11 +458,7 @@ impl App {
             } else {
                 0.0
             };
-            let content_w = if left.is_finite() {
-                (right - left) * k
-            } else {
-                0.0
-            };
+            let content_w = max_width as f32 * k;
             let w = (content_w + 2.0 * render::PADDING)
                 .max(height as f32)
                 .min(max_w);
@@ -531,30 +525,21 @@ impl App {
         let appearance = cfg.appearance.clone();
         drop(cfg);
 
-        let built: Vec<layout::Row>;
-        let rows;
-        let focused;
-        let viewport_w = self.viewport_width;
+        let rows: Vec<render::RowView>;
+        let focused: Option<layout::Row>;
         {
             let shared = self.shared.read().unwrap_or_else(|e| e.into_inner());
             if mode == "all" {
                 let ws_list = layout::all_rows(&shared.state);
-                built = ws_list
+                rows = ws_list
                     .iter()
-                    .map(|ws| {
-                        layout::build_row(
+                    .map(|ws| render::RowView {
+                        is_active: ws.is_active,
+                        row: layout::build_row(
                             ws,
                             &shared.state.windows.windows,
                             appearance.show_icons.then_some(&self.icons),
-                        )
-                    })
-                    .collect();
-                rows = built
-                    .iter()
-                    .zip(ws_list.iter())
-                    .map(|(row, ws)| render::RowView {
-                        is_active: ws.is_active,
-                        row,
+                        ),
                     })
                     .collect();
                 focused = None;
@@ -578,7 +563,6 @@ impl App {
             &mode,
             focused.as_ref(),
             &rows,
-            viewport_w,
             &self.icons,
             appearance.show_icons,
         ) else {

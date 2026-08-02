@@ -33,6 +33,17 @@ impl Default for IconCache {
     }
 }
 
+impl IconCache {
+    /// Insert a decoded icon directly (used by tests and pre-population).
+    #[cfg(test)]
+    pub fn insert(&self, app_id: impl Into<String>, icon: Pixmap) {
+        self.cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(app_id.into(), Some(icon));
+    }
+}
+
 /// Convenience wrappers around a shared cache (std Mutex does not deref).
 ///
 /// The mutex is locked exactly once here; do not call other locking entry
@@ -445,8 +456,10 @@ pub fn draw_icon(pix: &mut Pixmap, icon: &Pixmap, scale: f32, x: f32, y: f32, w:
         ..Default::default()
     };
     // map texture -> device: scale by k (then physical scale), then translate
-    // to the tile centre in device pixels.
-    let t = Transform::from_scale(k * scale, k * scale).pre_translate(dx * scale, dy * scale);
+    // to the tile centre in device pixels. The translation must be applied in
+    // device space (post_translate), otherwise it is scaled along with the
+    // image and the icon drifts away from the tile centre.
+    let t = Transform::from_scale(k * scale, k * scale).post_translate(dx * scale, dy * scale);
     pix.draw_pixmap(0, 0, icon.as_ref(), &paint, t, None);
 }
 

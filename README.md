@@ -18,6 +18,9 @@ rest of the time.
 - **Desktop icons**: window tiles can show the app's .desktop icon (PNG or
   SVG) instead of a plain rectangle; windows without a resolvable icon are
   skipped. Icons are resolved lazily once per app and cached.
+- **Last-focus marker**: in "all" mode, each workspace's last-focused window
+  is outlined with a distinct border colour, so you can spot where you left
+  off in every workspace at a glance.
 - Fully CPU-side rendering with tiny-skia; no GPU context, no shaders.
 - Event-driven redraws paced by compositor frame callbacks — bursts of niri
   events cost at most one repaint per display frame.
@@ -74,6 +77,8 @@ window_color = "#45475a"
 focused_color = "#89b4fa"
 window_opacity = 0.7
 show_icons = true        # draw .desktop icons in tiles; skip icon-less windows
+active_window_border_color = "#f38ba8"  # last-focused window outline
+active_window_border_width = 2
 
 [behavior]
 always_visible = true

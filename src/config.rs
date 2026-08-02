@@ -60,6 +60,12 @@ pub struct AppearanceConfig {
     pub workspace_gap: f64,
     pub active_workspace_border_color: String,
     pub active_workspace_border_width: f64,
+    /// Border colour of the workspace's last-focused window.
+    #[serde(default = "default_active_window_border_color")]
+    pub active_window_border_color: String,
+    /// Border width of the workspace's last-focused window.
+    #[serde(default = "default_active_window_border_width")]
+    pub active_window_border_width: f64,
 }
 
 impl Default for AppearanceConfig {
@@ -79,6 +85,8 @@ impl Default for AppearanceConfig {
             workspace_gap: 4.0,
             active_workspace_border_color: "#89b4fa".into(),
             active_workspace_border_width: 2.0,
+            active_window_border_color: "#f38ba8".into(),
+            active_window_border_width: 2.0,
         }
     }
 }
@@ -201,6 +209,14 @@ fn default_true() -> bool {
     true
 }
 
+fn default_active_window_border_color() -> String {
+    "#f38ba8".into()
+}
+
+fn default_active_window_border_width() -> f64 {
+    2.0
+}
+
 const DEFAULT_CONFIG: &str = r##"# nirimap configuration
 
 [display]
@@ -235,6 +251,9 @@ show_icons = true
 workspace_gap = 4
 active_workspace_border_color = "#89b4fa"
 active_workspace_border_width = 2
+# Border marking the workspace's last-focused window in the "all" preview.
+active_window_border_color = "#f38ba8"
+active_window_border_width = 2
 
 [behavior]
 always_visible = true

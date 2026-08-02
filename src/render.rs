@@ -11,16 +11,14 @@ use crate::layout::Row;
 pub const PADDING: f32 = 4.0;
 
 /// One workspace row to draw in "all" mode.
-pub struct RowView<'a> {
+pub struct RowView {
     pub is_active: bool,
-    pub row: &'a Row,
+    pub row: Row,
 }
 
 /// Render the minimap.
 ///
-/// `phys_w`/`phys_h` are buffer pixels, `scale` is the integer buffer scale and
-/// `viewport_width` is the focused output's logical width (used to align the
-/// viewport in "all" mode).
+/// `phys_w`/`phys_h` are buffer pixels, `scale` is the integer buffer scale.
 #[allow(clippy::too_many_arguments)]
 pub fn render(
     phys_w: u32,
@@ -29,8 +27,7 @@ pub fn render(
     cfg: &AppearanceConfig,
     mode: &str,
     focused: Option<&Row>,
-    rows: &[RowView<'_>],
-    viewport_width: f32,
+    rows: &[RowView],
     icons: &SharedIcons,
     show_icons: bool,
 ) -> Option<Vec<u8>> {
@@ -52,17 +49,7 @@ pub fn render(
     }
 
     if mode == "all" {
-        draw_all(
-            &mut pixmap,
-            s,
-            cfg,
-            rows,
-            log_w,
-            log_h,
-            viewport_width,
-            icons,
-            show_icons,
-        );
+        draw_all(&mut pixmap, s, cfg, rows, log_w, log_h, icons, show_icons);
     } else {
         draw_current(
             &mut pixmap,
@@ -95,7 +82,9 @@ fn draw_current(
     icons: &SharedIcons,
     show_icons: bool,
 ) {
-    let Some(row) = focused else { return };
+    let Some(row) = focused else {
+        return;
+    };
     if !row.has_content() {
         return;
     }
@@ -117,6 +106,7 @@ fn draw_current(
             t.w as f32 * k,
             t.h as f32 * k,
             t.focused,
+            t.is_last_focused,
             None,
             icons,
             t.app_id.as_deref(),
@@ -130,10 +120,9 @@ fn draw_all(
     pix: &mut Pixmap,
     s: Transform,
     cfg: &AppearanceConfig,
-    rows: &[RowView<'_>],
+    rows: &[RowView],
     log_w: f32,
     log_h: f32,
-    viewport_width: f32,
     icons: &SharedIcons,
     show_icons: bool,
 ) {
@@ -153,38 +142,24 @@ fn draw_all(
     }
     let k = row_h / global_max;
 
-    // Combined extent of the viewport-anchored content across all rows.
-    let mut left = f32::INFINITY;
-    let mut right = f32::NEG_INFINITY;
-    for r in rows {
-        if r.row.has_content() {
-            left = left.min(-r.row.align_x as f32);
-            right = right.max((r.row.total_width - r.row.align_x) as f32);
-        }
-    }
     let inner_w = (log_w - 2.0 * PADDING).max(0.0);
-    let anchor_x = if left.is_finite() {
-        let content_w = (right - left) * k;
-        if content_w > inner_w {
-            // Too wide: keep the viewport itself visible instead of the left edge.
-            let vp_scaled = viewport_width * k;
-            PADDING + ((inner_w - vp_scaled).max(0.0)) / 2.0
-        } else {
-            PADDING - left * k
-        }
-    } else {
-        PADDING
-    };
 
     let mut y = PADDING;
     for r in rows {
+        let content_w = r.row.total_width as f32 * k;
+        // Every row is left-aligned: the same workspace coordinate always
+        // maps to the same widget coordinate, so rows never shift relative
+        // to each other.
+        let row_w = content_w.min(inner_w).max(1.0);
         if r.is_active && cfg.active_workspace_border_width > 0.0 {
             let mut paint = Paint::default();
             match parse_hex(&cfg.active_workspace_border_color) {
                 Some((cr, cg, cb)) => set_paint_color(&mut paint, cr, cg, cb, 1.0),
                 None => set_paint_color(&mut paint, 0.54, 0.71, 0.98, 1.0),
             }
-            let rect = rect_min(PADDING, y, inner_w, row_h);
+            // The highlight hugs this row's content so it can never drift
+            // away from the tiles it marks.
+            let rect = rect_min(PADDING, y, row_w, row_h);
             let path = rounded_rect(rect, cfg.border_radius as f32);
             pix.stroke_path(
                 &path,
@@ -201,7 +176,7 @@ fn draw_all(
         if r.row.has_content() {
             let clip = rect_min(PADDING, y, inner_w, row_h);
             for t in &r.row.tiles {
-                let x = anchor_x + (t.x - r.row.align_x) as f32 * k;
+                let x = PADDING + t.x as f32 * k;
                 let ty = y + t.y as f32 * k;
                 draw_tile(
                     pix,
@@ -212,6 +187,7 @@ fn draw_all(
                     t.w as f32 * k,
                     t.h as f32 * k,
                     t.focused,
+                    t.is_last_focused,
                     Some(clip),
                     icons,
                     t.app_id.as_deref(),
@@ -233,6 +209,7 @@ fn draw_tile(
     w: f32,
     h: f32,
     focused: bool,
+    is_last_focused: bool,
     clip: Option<Rect>,
     icons: &SharedIcons,
     app_id: Option<&str>,
@@ -278,15 +255,25 @@ fn draw_tile(
         }
     }
 
-    if cfg.border_width > 0.0 {
-        if let Some((r, g, b)) = parse_hex(&cfg.border_color) {
+    // The workspace's last-focused window gets a special border so its
+    // position is easy to spot in the "all" preview.
+    let (border_color, border_width) = if is_last_focused {
+        (
+            &cfg.active_window_border_color,
+            cfg.active_window_border_width,
+        )
+    } else {
+        (&cfg.border_color, cfg.border_width)
+    };
+    if border_width > 0.0 {
+        if let Some((r, g, b)) = parse_hex(border_color) {
             let mut paint = Paint::default();
             set_paint_color(&mut paint, r, g, b, 1.0);
             pix.stroke_path(
                 &path,
                 &paint,
                 &Stroke {
-                    width: cfg.border_width as f32,
+                    width: border_width as f32,
                     ..Stroke::default()
                 },
                 s,
@@ -362,13 +349,21 @@ mod tests {
     use niri_ipc::{Window, WindowLayout, Workspace};
     use std::sync::{Arc, Mutex};
 
-    fn test_window(id: u64, col: usize, tile: usize, w: f64, h: f64) -> Window {
+    fn test_window(
+        id: u64,
+        ws: u64,
+        col: usize,
+        tile: usize,
+        w: f64,
+        h: f64,
+        view_x: f64,
+    ) -> Window {
         Window {
             id,
             title: Some(format!("win{id}")),
             app_id: Some("test".into()),
             pid: None,
-            workspace_id: Some(1),
+            workspace_id: Some(ws),
             is_focused: false,
             is_floating: false,
             is_urgent: false,
@@ -376,37 +371,41 @@ mod tests {
                 pos_in_scrolling_layout: Some((col, tile)),
                 tile_size: (w, h),
                 window_size: (w as i32, h as i32),
-                tile_pos_in_workspace_view: Some((0.0, 0.0)),
+                tile_pos_in_workspace_view: Some((view_x, 0.0)),
                 window_offset_in_tile: (0.0, 0.0),
             },
             focus_timestamp: None,
         }
     }
 
+    fn ws(id: u64, active: bool, focused: bool) -> Workspace {
+        Workspace {
+            id,
+            idx: 0,
+            name: Some(format!("{id}")),
+            output: Some("eDP-1".into()),
+            is_active: active,
+            is_focused: focused,
+            is_urgent: false,
+            active_window_id: None,
+        }
+    }
+
     #[test]
     fn renders_pixels_for_tiled_windows() {
         let mut snap = Snapshot::default();
-        snap.state.workspaces.workspaces.insert(
-            1,
-            Workspace {
-                id: 1,
-                idx: 0,
-                name: Some("1".into()),
-                output: Some("eDP-1".into()),
-                is_active: true,
-                is_focused: true,
-                is_urgent: false,
-                active_window_id: Some(10),
-            },
-        );
+        snap.state
+            .workspaces
+            .workspaces
+            .insert(1, ws(1, true, true));
         snap.state
             .windows
             .windows
-            .insert(10, test_window(10, 1, 1, 800.0, 600.0));
+            .insert(10, test_window(10, 1, 1, 1, 800.0, 600.0, 0.0));
         snap.state
             .windows
             .windows
-            .insert(11, test_window(11, 1, 2, 800.0, 400.0));
+            .insert(11, test_window(11, 1, 1, 2, 800.0, 400.0, 0.0));
 
         let ws = snap.state.workspaces.workspaces.get(&1).unwrap();
         let row = layout::build_row(ws, &snap.state.windows.windows, None);
@@ -423,7 +422,6 @@ mod tests {
             "current",
             Some(&row),
             &[],
-            1920.0,
             &icons,
             false,
         )
@@ -446,5 +444,255 @@ mod tests {
             parse_hex(&a.window_color),
             Some((69.0 / 255.0, 71.0 / 255.0, 90.0 / 255.0))
         );
+    }
+
+    #[test]
+    fn all_mode_rows_are_left_aligned() {
+        // Two workspaces with different scroll offsets: the same workspace x
+        // coordinate must map to the same widget x in every row, and the
+        // active-workspace highlight must hug the row's content width.
+        let mut snap = Snapshot::default();
+        snap.state
+            .workspaces
+            .workspaces
+            .insert(1, ws(1, true, true));
+        snap.state
+            .workspaces
+            .workspaces
+            .insert(2, ws(2, false, false));
+        snap.state
+            .windows
+            .windows
+            .insert(10, test_window(10, 1, 1, 1, 400.0, 600.0, 50.0));
+        snap.state
+            .windows
+            .windows
+            .insert(12, test_window(12, 2, 1, 1, 400.0, 800.0, 200.0));
+
+        let ws1 = snap.state.workspaces.workspaces.get(&1).unwrap();
+        let ws2 = snap.state.workspaces.workspaces.get(&2).unwrap();
+        let row1 = layout::build_row(ws1, &snap.state.windows.windows, None);
+        let row2 = layout::build_row(ws2, &snap.state.windows.windows, None);
+        let rows = [
+            RowView {
+                is_active: true,
+                row: row1,
+            },
+            RowView {
+                is_active: false,
+                row: row2,
+            },
+        ];
+
+        let cfg = Config::default();
+        let icons = Arc::new(Mutex::new(IconCache::default()));
+        let data = render(
+            128,
+            212,
+            1.0,
+            &cfg.appearance,
+            "all",
+            None,
+            &rows,
+            &icons,
+            false,
+        )
+        .expect("render should succeed");
+
+        fn first_colored(data: &[u8], w: usize, y: usize) -> Option<usize> {
+            (0..w).find(|&x| data[(y * w + x) * 4 + 3] != 0)
+        }
+        fn is_border(data: &[u8], w: usize, x: usize, y: usize) -> bool {
+            let px = &data[(y * w + x) * 4..(y * w + x) * 4 + 4];
+            // BGRA after the renderer's channel swap: blue channel dominates
+            // for #89b4fa.
+            px[0] > 200 && px[2] < 160
+        }
+
+        // Row 0 content starts at y=4, row 1 at y=108 (4 + 100 + 4 gap).
+        let left0 = first_colored(&data, 128, 40).expect("row 0 has content");
+        let left1 = first_colored(&data, 128, 150).expect("row 1 has content");
+        assert!(
+            (left0 as i32 - left1 as i32).abs() <= 1,
+            "rows must be left-aligned: left0={left0} left1={left1}"
+        );
+
+        // The active highlight is on row 0's top-left corner...
+        assert!(
+            is_border(&data, 128, 4, 4),
+            "active border should start at (4,4)"
+        );
+        // ...and stops at the row's content width (50px), not the widget width.
+        assert!(
+            !is_border(&data, 128, 56, 4),
+            "border must not span the full widget"
+        );
+    }
+
+    #[test]
+    fn icons_are_centered_in_their_tiles() {
+        // A 128px icon in a wide, short tile must be centred: the icon's left
+        // edge sits at the tile centre minus half the icon width, never scaled
+        // by the icon's own shrink factor.
+        let mut icon = tiny_skia::Pixmap::new(128, 128).unwrap();
+        icon.fill(tiny_skia::Color::from_rgba8(255, 0, 0, 255));
+        let icons = Arc::new(Mutex::new(IconCache::default()));
+        icons
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("test-icon", icon);
+
+        let mut snap = Snapshot::default();
+        snap.state
+            .workspaces
+            .workspaces
+            .insert(1, ws(1, true, true));
+        let mut win = test_window(10, 1, 1, 1, 800.0, 400.0, 0.0);
+        win.app_id = Some("test-icon".into());
+        snap.state.windows.windows.insert(10, win);
+        let ws = snap.state.workspaces.workspaces.get(&1).unwrap();
+        let row = layout::build_row(ws, &snap.state.windows.windows, Some(&icons));
+
+        let cfg = Config::default();
+        let data = render(
+            200,
+            100,
+            1.0,
+            &cfg.appearance,
+            "current",
+            Some(&row),
+            &[],
+            &icons,
+            true,
+        )
+        .expect("render should succeed");
+
+        fn red_px(data: &[u8], w: usize, x: usize, y: usize) -> bool {
+            let px = &data[(y * w + x) * 4..(y * w + x) * 4 + 4];
+            px[0] < 40 && px[2] > 200 // BGRA: red icon keeps B low, R high
+        }
+        fn leftmost_red(data: &[u8], w: usize, y: usize) -> Option<usize> {
+            (0..w).find(|&x| red_px(data, w, x, y))
+        }
+
+        // Tile (after the 2px gap inset): x0=9, w=182, h=90; icon 63px
+        // centred -> left edge at 68.5, so pixel 69 is the first fully
+        // covered one.
+        let left = leftmost_red(&data, 200, 50).expect("icon should be visible");
+        assert!(
+            (68..70).contains(&left),
+            "icon left edge must be centred, got {left}"
+        );
+        // Centre pixel is inside the icon...
+        assert!(red_px(&data, 200, 100, 50));
+        // ...while the tile's own left area is the background colour.
+        assert!(!red_px(&data, 200, 20, 50));
+    }
+
+    #[test]
+    fn all_mode_marks_last_focused_window() {
+        // Rows stay left-aligned; the workspace's last-focused window is
+        // outlined with the special border colour instead of being centred.
+        let mut snap = Snapshot::default();
+        let mut w1 = ws(1, true, true);
+        w1.active_window_id = Some(11); // column 2 of workspace 1
+        snap.state.workspaces.workspaces.insert(1, w1);
+        snap.state
+            .workspaces
+            .workspaces
+            .insert(2, ws(2, false, false));
+        for (i, col) in [1usize, 2, 3].into_iter().enumerate() {
+            snap.state.windows.windows.insert(
+                10 + i as u64,
+                test_window(10 + i as u64, 1, col, 1, 300.0, 400.0, 0.0),
+            );
+            snap.state.windows.windows.insert(
+                20 + i as u64,
+                test_window(20 + i as u64, 2, col, 1, 300.0, 400.0, 0.0),
+            );
+        }
+        // Window 11 (column 2 of workspace 1) was the last focused one.
+        snap.state.windows.windows.get_mut(&11).unwrap().is_focused = true;
+
+        let ws1 = snap.state.workspaces.workspaces.get(&1).unwrap();
+        let ws2 = snap.state.workspaces.workspaces.get(&2).unwrap();
+        let row1 = layout::build_row(ws1, &snap.state.windows.windows, None);
+        let row2 = layout::build_row(ws2, &snap.state.windows.windows, None);
+        assert_eq!(
+            row1.tiles.iter().filter(|t| t.is_last_focused).count(),
+            1,
+            "exactly one tile marked as last focused"
+        );
+        assert!(
+            row2.tiles.iter().all(|t| !t.is_last_focused),
+            "workspace without focus information has no special mark"
+        );
+
+        let rows = [
+            RowView {
+                is_active: true,
+                row: row1,
+            },
+            RowView {
+                is_active: false,
+                row: row2,
+            },
+        ];
+        let cfg = Config::default();
+        let icons = Arc::new(Mutex::new(IconCache::default()));
+        let data = render(
+            150,
+            212,
+            1.0,
+            &cfg.appearance,
+            "all",
+            None,
+            &rows,
+            &icons,
+            false,
+        )
+        .expect("render should succeed");
+
+        fn special_px(data: &[u8], w: usize, x: usize, y: usize) -> bool {
+            let px = &data[(y * w + x) * 4..(y * w + x) * 4 + 4];
+            // active_window_border_color #f38ba8 -> BGRA (168, 139, 243),
+            // distinct from focused fill (250, 180, 137) and window fill.
+            px[0] > 140 && px[0] < 200 && px[1] < 180 && px[2] > 230
+        }
+        fn special_range(data: &[u8], w: usize, y: usize) -> Option<(usize, usize)> {
+            let mut lo = None;
+            let mut hi = None;
+            for x in 0..w {
+                if special_px(data, w, x, y) {
+                    lo.get_or_insert(x);
+                    hi = Some(x);
+                }
+            }
+            Some((lo?, hi?))
+        }
+
+        // Both rows are left-aligned: content starts at the same x.
+        fn first_colored(data: &[u8], w: usize, y: usize) -> usize {
+            (0..w)
+                .find(|&x| data[(y * w + x) * 4 + 3] != 0)
+                .unwrap_or(w)
+        }
+        let left0 = first_colored(&data, 150, 40);
+        let left1 = first_colored(&data, 150, 150);
+        assert!(
+            (left0 as i32 - left1 as i32).abs() <= 1,
+            "rows must be left-aligned: left0={left0} left1={left1}"
+        );
+
+        // Row 0: the special border outlines column 2 (left ≈ 79, clipped by
+        // the widget's inner width at ≈ 146).
+        let (lo, hi) = special_range(&data, 150, 4).expect("special border visible");
+        assert!((78..82).contains(&lo), "special border left edge, got {lo}");
+        assert!(
+            (142..147).contains(&hi),
+            "special border right edge, got {hi}"
+        );
+        // Row 1: no special border.
+        assert!(special_range(&data, 150, 108).is_none());
     }
 }
