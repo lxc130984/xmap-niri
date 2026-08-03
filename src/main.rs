@@ -4,8 +4,6 @@ mod icons;
 mod ipc;
 mod layout;
 mod render;
-mod shm;
-mod signature;
 
 use std::sync::{Arc, RwLock};
 
@@ -37,24 +35,16 @@ fn main() -> Result<()> {
         globals.contents().clone_list().len()
     );
 
-    let mut event_loop: calloop::EventLoop<'static, App> = calloop::EventLoop::try_new()?;
-    let loop_handle = event_loop.handle();
-
-    let mut app = App::new(
-        &globals,
-        &qh,
-        shared.clone(),
-        config.clone(),
-        icons.clone(),
-        loop_handle.clone(),
-    )?;
+    let mut app = App::new(&globals, &qh, shared.clone(), config.clone(), icons.clone())?;
     app.init_outputs(&globals);
 
     let (tx, rx) = calloop::channel::channel::<UiMsg>();
     spawn_ipc_thread(shared, tx.clone(), icons)?;
     config::spawn_config_watcher(&config_path, tx.clone())?;
 
-    loop_handle
+    let mut event_loop: calloop::EventLoop<App> = calloop::EventLoop::try_new()?;
+    let handle = event_loop.handle();
+    handle
         .insert_source(rx, |msg, _, app| {
             if let calloop::channel::Event::Msg(m) = msg {
                 app.on_msg(m);
@@ -62,7 +52,7 @@ fn main() -> Result<()> {
         })
         .expect("failed to register the IPC channel");
     WaylandSource::new(conn, queue)
-        .insert(loop_handle.clone())
+        .insert(handle.clone())
         .expect("failed to register the Wayland source");
 
     log::info!("nirimap started");
