@@ -97,6 +97,11 @@ pub struct App {
     /// so this cache keeps floating windows in place across such focus
     /// changes. Only offsets derived from window data are stored.
     view_left_cache: RefCell<HashMap<u64, f64>>,
+    /// Pixel content of the last frame actually committed to the surface
+    /// (BGRA, one row-major frame). Diffing the next frame against it yields
+    /// the exact damage region, so the compositor only re-composites the
+    /// parts that really changed.
+    last_committed: Vec<u8>,
 }
 
 struct OutputInfo {
@@ -156,6 +161,7 @@ impl App {
             viewport_width: 1920.0,
             output_height: 1080.0,
             view_left_cache: RefCell::new(HashMap::new()),
+            last_committed: Vec::new(),
         };
         app.recreate_overlay();
         Ok(app)
@@ -240,6 +246,10 @@ impl App {
         self.desired_size = (0, 0);
         self.size_pending = false;
         self.size_requested = false;
+        // A fresh surface starts blank; the next frame must upload and
+        // damage everything, even if a recycled shm buffer still holds the
+        // previous pixels.
+        self.last_committed.clear();
         // A fresh surface has no buffer yet; the signature check must not
         // suppress its first draw even if the content is identical.
         self.surface_generation += 1;
@@ -599,19 +609,46 @@ impl App {
         };
         self.needed_phys = (phys_w, phys_h);
 
+        // Only the pixels that actually changed need to be uploaded and
+        // damaged. A pixel-identical frame (e.g. a config reload with the
+        // same visuals) is dropped entirely.
+        let Some((dx, dy, dw, dh)) =
+            render::diff_bbox(&self.last_committed, &self.render_scratch, phys_w, phys_h)
+        else {
+            self.last_sig = sig;
+            self.dirty = false;
+            return;
+        };
+        let full_frame = self.last_committed.len() != self.render_scratch.len();
+
         if let Some(i) = self.pool.acquire(phys_w, phys_h) {
             log::debug!("attaching buffer {phys_w}x{phys_h}");
-            self.pool.copy_pixels(i, &self.render_scratch);
+            if full_frame {
+                self.pool.copy_pixels(i, &self.render_scratch);
+            } else {
+                self.pool.copy_region(i, &self.render_scratch, phys_w, dx, dy, dw, dh);
+            }
             let buffer = self.pool.buffer(i);
             surface.attach(Some(&buffer), 0, 0);
             if surface.version() >= 4 {
-                surface.damage_buffer(0, 0, phys_w as i32, phys_h as i32);
+                surface.damage_buffer(dx as i32, dy as i32, dw as i32, dh as i32);
             } else {
-                surface.damage(0, 0, log_w as i32, log_h as i32);
+                // `damage` (pre-v4) is in surface (logical) coordinates.
+                let s = scale as f32;
+                surface.damage(
+                    (dx as f32 / s).floor() as i32,
+                    (dy as f32 / s).floor() as i32,
+                    (dw as f32 / s).ceil() as i32,
+                    (dh as f32 / s).ceil() as i32,
+                );
             }
             let cb = surface.frame(&self.qh, ());
             self.frame_cb = Some(cb);
             surface.commit();
+            if self.last_committed.len() != self.render_scratch.len() {
+                self.last_committed.resize(self.render_scratch.len(), 0);
+            }
+            self.last_committed.copy_from_slice(&self.render_scratch);
             self.last_sig = sig;
             self.dirty = false;
             self.last_draw_at = Some(Instant::now());

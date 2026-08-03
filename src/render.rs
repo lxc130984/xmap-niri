@@ -86,6 +86,50 @@ pub fn render_into(
     Some(())
 }
 
+/// Bounding box of the pixels that differ between two equal-sized BGRA
+/// frames.
+///
+/// `None` means the frames are pixel-identical and nothing needs to be
+/// redrawn or damaged. A missing or differently-sized `prev` yields the full
+/// rectangle, so a fresh surface or a resize always re-uploads everything.
+pub fn diff_bbox(
+    prev: &[u8],
+    next: &[u8],
+    w: u32,
+    h: u32,
+) -> Option<(u32, u32, u32, u32)> {
+    if prev.len() != next.len() || prev.is_empty() {
+        return Some((0, 0, w, h));
+    }
+    let mut min_x = u32::MAX;
+    let mut min_y = u32::MAX;
+    let mut max_x = 0u32;
+    let mut max_y = 0u32;
+    let mut changed = false;
+    let stride = w as usize * 4;
+    for y in 0..h as usize {
+        let row = y * stride;
+        for x in 0..w as usize {
+            let i = row + x * 4;
+            let a = u32::from_ne_bytes([prev[i], prev[i + 1], prev[i + 2], prev[i + 3]]);
+            let b = u32::from_ne_bytes([next[i], next[i + 1], next[i + 2], next[i + 3]]);
+            if a != b {
+                changed = true;
+                let (px, py) = (x as u32, y as u32);
+                min_x = min_x.min(px);
+                max_x = max_x.max(px);
+                min_y = min_y.min(py);
+                max_y = max_y.max(py);
+            }
+        }
+    }
+    if changed {
+        Some((min_x, min_y, max_x - min_x + 1, max_y - min_y + 1))
+    } else {
+        None
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_current(
     pix: &mut Pixmap,
@@ -963,5 +1007,33 @@ mod tests {
             !tile_at(&scratch, 200, 110, 110),
             "moved tile must not ghost at its old position"
         );
+    }
+
+    #[test]
+    fn diff_bbox_is_none_for_identical_frames() {
+        let a = vec![0u8; 4 * 4 * 4];
+        let b = a.clone();
+        assert_eq!(diff_bbox(&a, &b, 4, 4), None);
+    }
+
+    #[test]
+    fn diff_bbox_finds_the_changed_region() {
+        let a = vec![0u8; 4 * 4 * 4];
+        let mut b = a.clone();
+        // Change a single pixel in the middle of a 4x4 frame.
+        b[2 * 16 + 2 * 4 + 3] = 255;
+        assert_eq!(diff_bbox(&a, &b, 4, 4), Some((2, 2, 1, 1)));
+
+        // Change pixels at two corners: the bbox spans both.
+        b[0] = 1;
+        b[3 * 16 + 3 * 4 + 2] = 1;
+        assert_eq!(diff_bbox(&a, &b, 4, 4), Some((0, 0, 4, 4)));
+    }
+
+    #[test]
+    fn diff_bbox_is_full_for_missing_or_resized_previous_frame() {
+        let next = vec![7u8; 4 * 4 * 4];
+        assert_eq!(diff_bbox(&[], &next, 4, 4), Some((0, 0, 4, 4)));
+        assert_eq!(diff_bbox(&[0u8; 8], &next, 4, 4), Some((0, 0, 4, 4)));
     }
 }

@@ -141,6 +141,35 @@ impl BufferPool {
         dst.copy_from_slice(pixels);
     }
 
+    /// Copy a rectangular region of rendered pixels into a reserved buffer.
+    ///
+    /// `pixels` holds one full frame of `buf_w`-wide BGRA rows; only the
+    /// region `(x, y)` of size `(rw, rh)` is written, so unchanged areas of
+    /// the shared buffer keep their previous content and can be omitted from
+    /// the surface damage.
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_region(
+        &mut self,
+        i: usize,
+        pixels: &[u8],
+        buf_w: u32,
+        x: u32,
+        y: u32,
+        rw: u32,
+        rh: u32,
+    ) {
+        let Some(buf) = self.buffers.get_mut(i) else {
+            return;
+        };
+        let stride = buf_w as usize * 4;
+        for row in 0..rh as usize {
+            let src = (y as usize + row) * stride + x as usize * 4;
+            let dst = (y as usize + row) * (buf.w as usize * 4) + x as usize * 4;
+            let len = rw as usize * 4;
+            buf.mmap[dst..dst + len].copy_from_slice(&pixels[src..src + len]);
+        }
+    }
+
     /// The `wl_buffer` to attach for a reserved slot.
     pub fn buffer(&self, i: usize) -> WlBuffer {
         self.buffers[i].buffer.clone()
