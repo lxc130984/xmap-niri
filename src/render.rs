@@ -440,7 +440,7 @@ mod tests {
             .insert(11, test_window(11, 1, 1, 2, 800.0, 400.0, 0.0));
 
         let ws = snap.state.workspaces.workspaces.get(&1).unwrap();
-        let row = layout::build_row(ws, &snap.state.windows.windows, None);
+        let row = layout::build_row(ws, &snap.state.windows.windows, None, None, None);
         assert!(row.has_content());
         assert_eq!(row.tiles.len(), 2);
 
@@ -467,7 +467,7 @@ mod tests {
         assert!(data.chunks_exact(4).any(|px| px[3] != 0));
 
         // Icon mode with an unresolvable app_id filters the row to empty.
-        let row = layout::build_row(ws, &snap.state.windows.windows, Some(&icons));
+        let row = layout::build_row(ws, &snap.state.windows.windows, None, None, Some(&icons));
         assert!(!row.has_content());
     }
 
@@ -506,8 +506,8 @@ mod tests {
 
         let ws1 = snap.state.workspaces.workspaces.get(&1).unwrap();
         let ws2 = snap.state.workspaces.workspaces.get(&2).unwrap();
-        let row1 = layout::build_row(ws1, &snap.state.windows.windows, None);
-        let row2 = layout::build_row(ws2, &snap.state.windows.windows, None);
+        let row1 = layout::build_row(ws1, &snap.state.windows.windows, None, None, None);
+        let row2 = layout::build_row(ws2, &snap.state.windows.windows, None, None, None);
         let rows = [
             RowView {
                 is_active: true,
@@ -589,7 +589,7 @@ mod tests {
         win.app_id = Some("test-icon".into());
         snap.state.windows.windows.insert(10, win);
         let ws = snap.state.workspaces.workspaces.get(&1).unwrap();
-        let row = layout::build_row(ws, &snap.state.windows.windows, Some(&icons));
+        let row = layout::build_row(ws, &snap.state.windows.windows, None, None, Some(&icons));
 
         let cfg = Config::default();
         let mut scratch = Vec::new();
@@ -657,8 +657,8 @@ mod tests {
 
         let ws1 = snap.state.workspaces.workspaces.get(&1).unwrap();
         let ws2 = snap.state.workspaces.workspaces.get(&2).unwrap();
-        let row1 = layout::build_row(ws1, &snap.state.windows.windows, None);
-        let row2 = layout::build_row(ws2, &snap.state.windows.windows, None);
+        let row1 = layout::build_row(ws1, &snap.state.windows.windows, None, None, None);
+        let row2 = layout::build_row(ws2, &snap.state.windows.windows, None, None, None);
         assert_eq!(
             row1.tiles.iter().filter(|t| t.is_last_focused).count(),
             1,
@@ -761,7 +761,7 @@ mod tests {
         snap.state.windows.windows.insert(20, float);
 
         let ws = snap.state.workspaces.workspaces.get(&1).unwrap();
-        let row = layout::build_row(ws, &snap.state.windows.windows, None);
+        let row = layout::build_row(ws, &snap.state.windows.windows, None, None, None);
 
         let tiled = row.tiles.iter().find(|t| t.w == 400.0).unwrap();
         assert_eq!(tiled.x, 0.0);
@@ -828,11 +828,11 @@ mod tests {
             let rows = [
                 RowView {
                     is_active: true,
-                    row: layout::build_row(ws1, &snap.state.windows.windows, None),
+                    row: layout::build_row(ws1, &snap.state.windows.windows, None, None, None),
                 },
                 RowView {
                     is_active: false,
-                    row: layout::build_row(ws2, &snap.state.windows.windows, None),
+                    row: layout::build_row(ws2, &snap.state.windows.windows, None, None, None),
                 },
             ];
             render_into(
@@ -859,11 +859,11 @@ mod tests {
             let rows = [
                 RowView {
                     is_active: true,
-                    row: layout::build_row(ws1, &snap.state.windows.windows, None),
+                    row: layout::build_row(ws1, &snap.state.windows.windows, None, None, None),
                 },
                 RowView {
                     is_active: false,
-                    row: layout::build_row(ws2, &snap.state.windows.windows, None),
+                    row: layout::build_row(ws2, &snap.state.windows.windows, None, None, None),
                 },
             ];
             render_into(
@@ -919,7 +919,7 @@ mod tests {
 
         {
             let ws = snap.state.workspaces.workspaces.get(&1).unwrap();
-            let row = layout::build_row(ws, &snap.state.windows.windows, None);
+            let row = layout::build_row(ws, &snap.state.windows.windows, None, None, None);
             render_into(
                 &mut scratch,
                 200,
@@ -944,7 +944,7 @@ mod tests {
         win.layout.tile_pos_in_workspace_view = Some((2000.0, 2000.0));
         {
             let ws = snap.state.workspaces.workspaces.get(&1).unwrap();
-            let row = layout::build_row(ws, &snap.state.windows.windows, None);
+            let row = layout::build_row(ws, &snap.state.windows.windows, None, None, None);
             render_into(
                 &mut scratch,
                 200,

@@ -41,6 +41,10 @@ rest of the time.
   oversized buffers are reclaimed when the widget shrinks.
 - **No per-frame allocation in the hot path.** The render pixmap is a reused
   scratch buffer, so steady-state redraws allocate nothing.
+- **Commit rate capped at ~30 fps.** Continuous event streams (window drags,
+  layout animations) cannot force the compositor to re-composite the minimap
+  faster than every 33 ms; a one-shot timer guarantees the final state of a
+  burst is still drawn.
 - **Icon lookup is cached.** Each `app_id` is resolved at most once (misses
   included), off the render thread; steady-state drawing is one hash lookup
   and a small scaled blit per window.
@@ -97,5 +101,8 @@ active_window_border_width = 2
   swap for `wl_shm` ARGB8888.
 - `src/icons.rs` — lazy .desktop icon resolution (PNG via tiny-skia, SVG via
   resvg) with a shared cache.
-- `src/app.rs` — the layer-shell surface, shm buffer pool, and frame-callback
-  pacing.
+- `src/app.rs` — the layer-shell surface, the Wayland state machine, and the
+  frame-callback-paced redraw loop.
+- `src/shm.rs` — the shared-memory buffer pool (double buffering, reuse,
+  memory reclaim).
+- `src/signature.rs` — the content hash that skips redundant redraws.
