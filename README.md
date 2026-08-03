@@ -99,7 +99,3 @@ active_window_border_width = 2
   resvg) with a shared cache.
 - `src/app.rs` — the layer-shell surface, shm buffer pool, and frame-callback
   pacing.
-
-## License
-
-MIT
