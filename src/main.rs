@@ -6,10 +6,8 @@ mod layout;
 mod render;
 
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
 
 use anyhow::{Context, Result};
-use calloop::timer::{TimeoutAction, Timer};
 use calloop_wayland_source::WaylandSource;
 use wayland_client::globals::registry_queue_init;
 use wayland_client::Connection;
@@ -41,7 +39,7 @@ fn main() -> Result<()> {
     app.init_outputs(&globals);
 
     let (tx, rx) = calloop::channel::channel::<UiMsg>();
-    spawn_ipc_thread(shared, config.clone(), tx.clone(), icons)?;
+    spawn_ipc_thread(shared, tx.clone(), icons)?;
     config::spawn_config_watcher(&config_path, tx.clone())?;
 
     let mut event_loop: calloop::EventLoop<App> = calloop::EventLoop::try_new()?;
@@ -56,15 +54,6 @@ fn main() -> Result<()> {
     WaylandSource::new(conn, queue)
         .insert(handle.clone())
         .expect("failed to register the Wayland source");
-    handle
-        .insert_source(
-            Timer::from_duration(Duration::from_millis(250)),
-            |_, _, app| {
-                app.on_hide_tick();
-                TimeoutAction::ToDuration(Duration::from_millis(250))
-            },
-        )
-        .expect("failed to register the hide-tick timer");
 
     log::info!("nirimap started");
     event_loop.run(None, &mut app, |_| {})?;

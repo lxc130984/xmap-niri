@@ -16,11 +16,14 @@ pub struct RowView {
     pub row: Row,
 }
 
-/// Render the minimap.
+/// Render the minimap into a reusable scratch buffer.
 ///
 /// `phys_w`/`phys_h` are buffer pixels, `scale` is the integer buffer scale.
+/// The buffer is resized in place and returned in `scratch`, so steady-state
+/// redraws never allocate a fresh pixmap.
 #[allow(clippy::too_many_arguments)]
-pub fn render(
+pub fn render_into(
+    scratch: &mut Vec<u8>,
     phys_w: u32,
     phys_h: u32,
     scale: f32,
@@ -30,8 +33,19 @@ pub fn render(
     rows: &[RowView],
     icons: &SharedIcons,
     show_icons: bool,
-) -> Option<Vec<u8>> {
-    let mut pixmap = Pixmap::new(phys_w, phys_h)?;
+) -> Option<()> {
+    let len = phys_w
+        .checked_mul(phys_h)
+        .and_then(|n| n.checked_mul(4))? as usize;
+    scratch.resize(len, 0);
+    // `Vec::resize` keeps the previous bytes; `Pixmap::from_vec` does not
+    // zero them either. Regions the painter does not touch (transparent
+    // background, moving tiles) would otherwise keep last frame's pixels and
+    // ghost into the new frame, which looks like corrupted output whenever
+    // content moves — floating windows are the most visible case.
+    scratch.fill(0);
+    let mut pixmap =
+        Pixmap::from_vec(std::mem::take(scratch), tiny_skia::IntSize::from_wh(phys_w, phys_h)?)?;
     let s = Transform::from_scale(scale, scale);
     let log_w = phys_w as f32 / scale;
     let log_h = phys_h as f32 / scale;
@@ -64,11 +78,12 @@ pub fn render(
     }
 
     // tiny-skia is RGBA; wl_shm ARGB8888 wants BGRA.
-    let mut data = pixmap.data().to_vec();
+    let mut data = pixmap.take();
     for px in data.chunks_exact_mut(4) {
         px.swap(0, 2);
     }
-    Some(data)
+    *scratch = data;
+    Some(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -89,11 +104,11 @@ fn draw_current(
         return;
     }
     let inner_h = (log_h - 2.0 * PADDING).max(0.0);
-    if inner_h <= 0.0 || row.max_height <= 0.0 {
+    if inner_h <= 0.0 || row.scale_h() <= 0.0 {
         return;
     }
-    let k = inner_h / row.max_height as f32;
-    let content_w = row.total_width as f32 * k;
+    let k = inner_h / row.scale_h() as f32;
+    let content_w = row.scale_w() as f32 * k;
     let x0 = PADDING + ((log_w - 2.0 * PADDING - content_w).max(0.0)) / 2.0;
     let y0 = PADDING;
     for t in &row.tiles {
@@ -132,21 +147,38 @@ fn draw_all(
     let n = rows.len() as f32;
     let gap = cfg.workspace_gap as f32;
     let row_h = ((log_h - 2.0 * PADDING - (n - 1.0) * gap) / n).max(1.0);
-    let global_max = rows
+
+    // One shared scale for all tiled rows, derived from the tallest tiled
+    // column, so rows stay comparable. Floating windows are overlays and are
+    // deliberately excluded: dragging one must not resize every row.
+    let max_tiled_h = rows
         .iter()
-        .filter(|r| r.row.has_content())
+        .filter(|r| r.row.has_tiled())
         .map(|r| r.row.max_height as f32)
         .fold(0.0_f32, f32::max);
-    if global_max <= 0.0 {
+    if max_tiled_h <= 0.0 && rows.iter().all(|r| !r.row.has_content()) {
         return;
     }
-    let k = row_h / global_max;
+    let k = if max_tiled_h > 0.0 {
+        row_h / max_tiled_h
+    } else {
+        0.0
+    };
 
     let inner_w = (log_w - 2.0 * PADDING).max(0.0);
 
     let mut y = PADDING;
     for r in rows {
-        let content_w = r.row.total_width as f32 * k;
+        // Rows without tiled windows scale by their own floating extent so
+        // their windows stay visible; everything else shares the global k.
+        let (rk, content_w) = if r.row.has_tiled() {
+            (k, r.row.total_width as f32 * k)
+        } else if r.row.float_height > 0.0 {
+            let rk = row_h / r.row.float_height as f32;
+            (rk, r.row.float_width as f32 * rk)
+        } else {
+            (0.0, 0.0)
+        };
         // Every row is left-aligned: the same workspace coordinate always
         // maps to the same widget coordinate, so rows never shift relative
         // to each other.
@@ -176,16 +208,16 @@ fn draw_all(
         if r.row.has_content() {
             let clip = rect_min(PADDING, y, inner_w, row_h);
             for t in &r.row.tiles {
-                let x = PADDING + t.x as f32 * k;
-                let ty = y + t.y as f32 * k;
+                let x = PADDING + t.x as f32 * rk;
+                let ty = y + t.y as f32 * rk;
                 draw_tile(
                     pix,
                     s,
                     cfg,
                     x,
                     ty,
-                    t.w as f32 * k,
-                    t.h as f32 * k,
+                    t.w as f32 * rk,
+                    t.h as f32 * rk,
                     t.focused,
                     t.is_last_focused,
                     Some(clip),
@@ -414,7 +446,9 @@ mod tests {
 
         let cfg = Config::default();
         let icons = Arc::new(Mutex::new(IconCache::default()));
-        let data = render(
+        let mut scratch = Vec::new();
+        render_into(
+            &mut scratch,
             200,
             200,
             1.0,
@@ -426,6 +460,7 @@ mod tests {
             false,
         )
         .expect("render should succeed");
+        let data = &scratch;
         assert_eq!(data.len(), 200 * 200 * 4);
         // With show_icons=false, tiles draw colored rects: at least one pixel
         // must be non-transparent.
@@ -486,7 +521,9 @@ mod tests {
 
         let cfg = Config::default();
         let icons = Arc::new(Mutex::new(IconCache::default()));
-        let data = render(
+        let mut scratch = Vec::new();
+        render_into(
+            &mut scratch,
             128,
             212,
             1.0,
@@ -498,6 +535,7 @@ mod tests {
             false,
         )
         .expect("render should succeed");
+        let data = &scratch;
 
         fn first_colored(data: &[u8], w: usize, y: usize) -> Option<usize> {
             (0..w).find(|&x| data[(y * w + x) * 4 + 3] != 0)
@@ -510,8 +548,8 @@ mod tests {
         }
 
         // Row 0 content starts at y=4, row 1 at y=108 (4 + 100 + 4 gap).
-        let left0 = first_colored(&data, 128, 40).expect("row 0 has content");
-        let left1 = first_colored(&data, 128, 150).expect("row 1 has content");
+        let left0 = first_colored(data, 128, 40).expect("row 0 has content");
+        let left1 = first_colored(data, 128, 150).expect("row 1 has content");
         assert!(
             (left0 as i32 - left1 as i32).abs() <= 1,
             "rows must be left-aligned: left0={left0} left1={left1}"
@@ -519,12 +557,12 @@ mod tests {
 
         // The active highlight is on row 0's top-left corner...
         assert!(
-            is_border(&data, 128, 4, 4),
+            is_border(data, 128, 4, 4),
             "active border should start at (4,4)"
         );
         // ...and stops at the row's content width (50px), not the widget width.
         assert!(
-            !is_border(&data, 128, 56, 4),
+            !is_border(data, 128, 56, 4),
             "border must not span the full widget"
         );
     }
@@ -554,7 +592,9 @@ mod tests {
         let row = layout::build_row(ws, &snap.state.windows.windows, Some(&icons));
 
         let cfg = Config::default();
-        let data = render(
+        let mut scratch = Vec::new();
+        render_into(
+            &mut scratch,
             200,
             100,
             1.0,
@@ -566,6 +606,7 @@ mod tests {
             true,
         )
         .expect("render should succeed");
+        let data = &scratch;
 
         fn red_px(data: &[u8], w: usize, x: usize, y: usize) -> bool {
             let px = &data[(y * w + x) * 4..(y * w + x) * 4 + 4];
@@ -578,15 +619,15 @@ mod tests {
         // Tile (after the 2px gap inset): x0=9, w=182, h=90; icon 63px
         // centred -> left edge at 68.5, so pixel 69 is the first fully
         // covered one.
-        let left = leftmost_red(&data, 200, 50).expect("icon should be visible");
+        let left = leftmost_red(data, 200, 50).expect("icon should be visible");
         assert!(
             (68..70).contains(&left),
             "icon left edge must be centred, got {left}"
         );
         // Centre pixel is inside the icon...
-        assert!(red_px(&data, 200, 100, 50));
+        assert!(red_px(data, 200, 100, 50));
         // ...while the tile's own left area is the background colour.
-        assert!(!red_px(&data, 200, 20, 50));
+        assert!(!red_px(data, 200, 20, 50));
     }
 
     #[test]
@@ -640,7 +681,9 @@ mod tests {
         ];
         let cfg = Config::default();
         let icons = Arc::new(Mutex::new(IconCache::default()));
-        let data = render(
+        let mut scratch = Vec::new();
+        render_into(
+            &mut scratch,
             150,
             212,
             1.0,
@@ -652,6 +695,7 @@ mod tests {
             false,
         )
         .expect("render should succeed");
+        let data = &scratch;
 
         fn special_px(data: &[u8], w: usize, x: usize, y: usize) -> bool {
             let px = &data[(y * w + x) * 4..(y * w + x) * 4 + 4];
@@ -677,8 +721,8 @@ mod tests {
                 .find(|&x| data[(y * w + x) * 4 + 3] != 0)
                 .unwrap_or(w)
         }
-        let left0 = first_colored(&data, 150, 40);
-        let left1 = first_colored(&data, 150, 150);
+        let left0 = first_colored(data, 150, 40);
+        let left1 = first_colored(data, 150, 150);
         assert!(
             (left0 as i32 - left1 as i32).abs() <= 1,
             "rows must be left-aligned: left0={left0} left1={left1}"
@@ -686,13 +730,238 @@ mod tests {
 
         // Row 0: the special border outlines column 2 (left ≈ 79, clipped by
         // the widget's inner width at ≈ 146).
-        let (lo, hi) = special_range(&data, 150, 4).expect("special border visible");
+        let (lo, hi) = special_range(data, 150, 4).expect("special border visible");
         assert!((78..82).contains(&lo), "special border left edge, got {lo}");
         assert!(
             (142..147).contains(&hi),
             "special border right edge, got {hi}"
         );
         // Row 1: no special border.
-        assert!(special_range(&data, 150, 108).is_none());
+        assert!(special_range(data, 150, 108).is_none());
+    }
+
+    #[test]
+    fn floating_windows_are_placed_in_the_row() {
+        let mut snap = Snapshot::default();
+        let mut w1 = ws(1, true, true);
+        w1.active_window_id = Some(20);
+        snap.state.workspaces.workspaces.insert(1, w1);
+        // Tiled window at column 1 (workspace x 0) shown at viewport x -200:
+        // the viewport's left edge is at workspace x 200.
+        snap.state
+            .windows
+            .windows
+            .insert(10, test_window(10, 1, 1, 1, 400.0, 500.0, -200.0));
+        // Floating window at viewport (100, 200), size 300x200.
+        let mut float = test_window(20, 1, 1, 1, 300.0, 200.0, 100.0);
+        float.layout.pos_in_scrolling_layout = None;
+        float.layout.tile_pos_in_workspace_view = Some((100.0, 200.0));
+        float.layout.window_size = (300, 200);
+        float.is_focused = true;
+        snap.state.windows.windows.insert(20, float);
+
+        let ws = snap.state.workspaces.workspaces.get(&1).unwrap();
+        let row = layout::build_row(ws, &snap.state.windows.windows, None);
+
+        let tiled = row.tiles.iter().find(|t| t.w == 400.0).unwrap();
+        assert_eq!(tiled.x, 0.0);
+        let fl = row.tiles.iter().find(|t| t.w == 300.0).unwrap();
+        assert_eq!(
+            fl.x, 300.0,
+            "floating x = viewport offset (200) + view x (100)"
+        );
+        assert_eq!(fl.y, 200.0);
+        assert_eq!(fl.w, 300.0);
+        assert_eq!(fl.h, 200.0);
+        assert!(fl.is_last_focused);
+        // Scaling metrics come from the tiled layout only; the floating
+        // window is an overlay and keeps its own extent.
+        assert_eq!(row.total_width, 400.0);
+        assert_eq!(row.max_height, 500.0);
+        assert_eq!(row.float_width, 600.0);
+        assert_eq!(row.float_height, 400.0);
+        assert_eq!(row.scale_w(), 400.0);
+        assert_eq!(row.scale_h(), 500.0);
+    }
+
+    #[test]
+    fn floating_windows_do_not_rescale_other_rows() {
+        // Moving a floating window in one workspace must not change the
+        // scaling of any other row (or of the tiled windows in its own row).
+        let mut snap = Snapshot::default();
+        snap.state
+            .workspaces
+            .workspaces
+            .insert(1, ws(1, true, true));
+        snap.state
+            .workspaces
+            .workspaces
+            .insert(2, ws(2, false, false));
+        snap.state
+            .windows
+            .windows
+            .insert(10, test_window(10, 1, 1, 1, 400.0, 500.0, 0.0));
+        snap.state
+            .windows
+            .windows
+            .insert(20, test_window(20, 2, 1, 1, 300.0, 400.0, 0.0));
+        let mut float = test_window(21, 2, 1, 1, 300.0, 200.0, 0.0);
+        float.layout.pos_in_scrolling_layout = None;
+        float.layout.window_size = (300, 200);
+        snap.state.windows.windows.insert(21, float);
+
+        let cfg = Config::default();
+        let icons = Arc::new(Mutex::new(IconCache::default()));
+        let mut scratch = Vec::new();
+
+        fn row_tile_left(data: &[u8], w: usize, y: usize) -> Option<usize> {
+            (0..w).find(|&x| data[(y * w + x) * 4 + 3] != 0)
+        }
+
+        let ws1 = snap.state.workspaces.workspaces.get(&1).unwrap();
+        let ws2 = snap.state.workspaces.workspaces.get(&2).unwrap();
+
+        // First frame: float near the top of workspace 2.
+        snap.state.windows.windows.get_mut(&21).unwrap()
+            .layout.tile_pos_in_workspace_view = Some((50.0, 10.0));
+        {
+            let rows = [
+                RowView {
+                    is_active: true,
+                    row: layout::build_row(ws1, &snap.state.windows.windows, None),
+                },
+                RowView {
+                    is_active: false,
+                    row: layout::build_row(ws2, &snap.state.windows.windows, None),
+                },
+            ];
+            render_into(
+                &mut scratch,
+                150,
+                212,
+                1.0,
+                &cfg.appearance,
+                "all",
+                None,
+                &rows,
+                &icons,
+                false,
+            )
+            .unwrap();
+        }
+        let row1_left = row_tile_left(&scratch, 150, 40).expect("row 1 tile");
+        let row2_tiled_left = row_tile_left(&scratch, 150, 150).expect("row 2 tiled tile");
+
+        // Second frame: float dragged far down, well beyond the tiled area.
+        snap.state.windows.windows.get_mut(&21).unwrap()
+            .layout.tile_pos_in_workspace_view = Some((50.0, 8000.0));
+        {
+            let rows = [
+                RowView {
+                    is_active: true,
+                    row: layout::build_row(ws1, &snap.state.windows.windows, None),
+                },
+                RowView {
+                    is_active: false,
+                    row: layout::build_row(ws2, &snap.state.windows.windows, None),
+                },
+            ];
+            render_into(
+                &mut scratch,
+                150,
+                212,
+                1.0,
+                &cfg.appearance,
+                "all",
+                None,
+                &rows,
+                &icons,
+                false,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            row_tile_left(&scratch, 150, 40),
+            Some(row1_left),
+            "workspace 1 must not rescale when workspace 2's float moves"
+        );
+        assert_eq!(
+            row_tile_left(&scratch, 150, 150),
+            Some(row2_tiled_left),
+            "workspace 2's tiled window must not rescale when its float moves"
+        );
+    }
+
+    #[test]
+    fn reused_scratch_does_not_ghost_old_pixels() {
+        // Two renders into the same scratch buffer with different content:
+        // regions that were covered by a tile in the first frame and are
+        // empty in the second must be transparent, not stale pixels from the
+        // previous frame.
+        let mut snap = Snapshot::default();
+        snap.state
+            .workspaces
+            .workspaces
+            .insert(1, ws(1, true, true));
+        let mut win = test_window(10, 1, 1, 1, 300.0, 200.0, 0.0);
+        win.layout.pos_in_scrolling_layout = None;
+        win.is_focused = true;
+        win.layout.tile_pos_in_workspace_view = Some((100.0, 100.0));
+        snap.state.windows.windows.insert(10, win);
+
+        let cfg = Config::default(); // background_opacity = 0.0
+        let icons = Arc::new(Mutex::new(IconCache::default()));
+        let mut scratch = Vec::new();
+
+        fn tile_at(data: &[u8], w: usize, x: usize, y: usize) -> bool {
+            data[(y * w + x) * 4 + 3] != 0
+        }
+
+        {
+            let ws = snap.state.workspaces.workspaces.get(&1).unwrap();
+            let row = layout::build_row(ws, &snap.state.windows.windows, None);
+            render_into(
+                &mut scratch,
+                200,
+                200,
+                1.0,
+                &cfg.appearance,
+                "current",
+                Some(&row),
+                &[],
+                &icons,
+                false,
+            )
+            .unwrap();
+        }
+        assert!(
+            tile_at(&scratch, 200, 110, 110),
+            "first frame draws the floating tile"
+        );
+
+        // Move the floating window far outside the widget.
+        let win = snap.state.windows.windows.get_mut(&10).unwrap();
+        win.layout.tile_pos_in_workspace_view = Some((2000.0, 2000.0));
+        {
+            let ws = snap.state.workspaces.workspaces.get(&1).unwrap();
+            let row = layout::build_row(ws, &snap.state.windows.windows, None);
+            render_into(
+                &mut scratch,
+                200,
+                200,
+                1.0,
+                &cfg.appearance,
+                "current",
+                Some(&row),
+                &[],
+                &icons,
+                false,
+            )
+            .unwrap();
+        }
+        assert!(
+            !tile_at(&scratch, 200, 110, 110),
+            "moved tile must not ghost at its old position"
+        );
     }
 }

@@ -21,27 +21,33 @@ rest of the time.
 - **Last-focus marker**: in "all" mode, each workspace's last-focused window
   is outlined with a distinct border colour, so you can spot where you left
   off in every workspace at a glance.
+- Floating windows are rendered too, placed from their viewport position
+  (they are skipped only while scrolled outside the view, where niri stops
+  reporting a position). They are drawn as overlays and never change the
+  minimap's scaling, so dragging one does not resize the other rows.
 - Fully CPU-side rendering with tiny-skia; no GPU context, no shaders.
-- Event-driven redraws paced by compositor frame callbacks — bursts of niri
-  events cost at most one repaint per display frame.
-- Optional auto-hide after a configurable idle timeout.
+- Event-driven redraws paced by compositor frame callbacks, with a content
+  hash so events that don't change the minimap (urgency, focus timestamps,
+  keyboard layout churn) never trigger a repaint.
+- Always visible; no hide logic, no polling timers, no idle wake-ups.
 - Live-reloads `config.toml` while running.
 
 ## Why it is light
 
 - **Small buffers.** The widget is a few hundred logical pixels at most, and
   shm buffers are shared-memory only — no GPU allocations.
-- **Triple-buffered, reused.** At most 3 buffers are kept; the compositor's
-  `wl_buffer.release` returns them to the pool instead of reallocating.
-- **No per-frame allocation in the hot path.** Rows are built from the niri
-  event state and rasterized with tiny-skia directly into the buffer.
+- **Double-buffered, reused.** At most 2 buffers are kept; the compositor's
+  `wl_buffer.release` returns them to the pool instead of reallocating, and
+  oversized buffers are reclaimed when the widget shrinks.
+- **No per-frame allocation in the hot path.** The render pixmap is a reused
+  scratch buffer, so steady-state redraws allocate nothing.
 - **Icon lookup is cached.** Each `app_id` is resolved at most once (misses
   included), off the render thread; steady-state drawing is one hash lookup
   and a small scaled blit per window.
 - **One IPC thread, one UI thread.** No polling loops; niri pushes state
-  changes over its socket, and the UI thread only wakes on real events.
-- **Idle by default:** when hidden, the surface is detached and all buffers
-  freed.
+  changes over its socket, irrelevant events are filtered in the IPC thread,
+  and the UI thread only wakes when the minimap could actually change.
+- **Idle by default:** with no events, the process sleeps with zero redraws.
 
 ## Build
 
@@ -79,10 +85,6 @@ window_opacity = 0.7
 show_icons = true        # draw .desktop icons in tiles; skip icon-less windows
 active_window_border_color = "#f38ba8"  # last-focused window outline
 active_window_border_width = 2
-
-[behavior]
-always_visible = true
-hide_timeout_ms = 2000  # only used when always_visible = false
 ```
 
 ## How it works

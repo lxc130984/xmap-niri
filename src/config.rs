@@ -15,7 +15,6 @@ use crate::ipc::UiMsg;
 pub struct Config {
     pub display: DisplayConfig,
     pub appearance: AppearanceConfig,
-    pub behavior: BehaviorConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -91,14 +90,6 @@ impl Default for AppearanceConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(default)]
-pub struct BehaviorConfig {
-    pub always_visible: bool,
-    pub hide_timeout_ms: u64,
-    pub show_for_floating_windows: bool,
-}
-
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -114,11 +105,6 @@ impl Default for Config {
             },
             appearance: AppearanceConfig {
                 ..AppearanceConfig::default()
-            },
-            behavior: BehaviorConfig {
-                always_visible: true,
-                hide_timeout_ms: 2000,
-                show_for_floating_windows: false,
             },
         }
     }
@@ -254,12 +240,4 @@ active_workspace_border_width = 2
 # Border marking the workspace's last-focused window in the "all" preview.
 active_window_border_color = "#f38ba8"
 active_window_border_width = 2
-
-[behavior]
-always_visible = true
-# Only used when always_visible = false: hide this many milliseconds after the
-# last relevant event.
-hide_timeout_ms = 2000
-# Show the minimap on floating-window activity (popups, dialogs, ...).
-show_for_floating_windows = false
 "##;

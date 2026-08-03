@@ -8,7 +8,6 @@
 use std::fs::File;
 use std::os::fd::{AsFd, FromRawFd};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 use log::{debug, warn};
@@ -36,8 +35,9 @@ use crate::icons::SharedIcons;
 use crate::ipc::{Shared, UiMsg};
 use crate::{layout, render};
 
-/// Maximum number of shm buffers kept around (double/triple buffering).
-const MAX_BUFFERS: usize = 3;
+/// Maximum number of shm buffers kept around (double buffering: one being
+/// presented, one being drawn).
+const MAX_BUFFERS: usize = 2;
 
 pub struct App {
     qh: QueueHandle<App>,
@@ -54,7 +54,6 @@ pub struct App {
     buffers: Vec<ShmBuffer>,
     next_buffer_id: u64,
 
-    visible: bool,
     dirty: bool,
     frame_cb: Option<WlCallback>,
     surface_scale: i32,
@@ -64,7 +63,23 @@ pub struct App {
     desired_size: (u32, u32),
     /// A resize request is in flight; wait for the next configure.
     size_pending: bool,
-    hide_deadline: Option<Instant>,
+    /// Whether the current overlay surface has ever been sized via set_size.
+    /// Reset on every recreate; the first commit of a fresh layer surface
+    /// must carry a size or the compositor rejects it.
+    size_requested: bool,
+
+    /// Scratch buffer reused across frames so steady-state rendering never
+    /// allocates a new pixmap.
+    render_scratch: Vec<u8>,
+    /// Physical size of the buffer used by the last draw (for reclaiming
+    /// oversized buffers when the widget shrinks).
+    needed_phys: (u32, u32),
+    /// Hash of everything that affects the rendered pixels. When an event
+    /// leaves it unchanged, the redraw is skipped entirely.
+    last_sig: u64,
+    /// Bumped on every surface recreate so a fresh surface always gets a
+    /// buffer, even when its content would otherwise be "unchanged".
+    surface_generation: u64,
 
     focused_output_name: Option<String>,
     viewport_width: f32,
@@ -146,11 +161,6 @@ impl App {
         let shm = globals.bind::<WlShm, _, _>(qh, 1..=1, ())?;
         let layer_shell = globals.bind::<ZwlrLayerShellV1, _, _>(qh, 1..=1, ())?;
         log::info!("bound wl_compositor, wl_shm and zwlr_layer_shell_v1");
-        let visible = config
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .behavior
-            .always_visible;
 
         let mut app = App {
             qh: qh.clone(),
@@ -164,14 +174,17 @@ impl App {
             icons,
             buffers: Vec::new(),
             next_buffer_id: 1,
-            visible,
             dirty: true,
             frame_cb: None,
             surface_scale: 1,
             configured: None,
             desired_size: (0, 0),
             size_pending: false,
-            hide_deadline: None,
+            size_requested: false,
+            render_scratch: Vec::new(),
+            needed_phys: (0, 0),
+            last_sig: 0,
+            surface_generation: 0,
             focused_output_name: None,
             viewport_width: 1920.0,
             output_height: 1080.0,
@@ -205,41 +218,23 @@ impl App {
 
     pub fn on_msg(&mut self, msg: UiMsg) {
         match msg {
-            UiMsg::StateChanged { show } => self.on_state_changed(show),
+            UiMsg::StateChanged => self.on_state_changed(),
             UiMsg::ConfigReload => self.on_config_reload(),
         }
     }
 
-    fn on_state_changed(&mut self, show: bool) {
+    fn on_state_changed(&mut self) {
         self.update_focused_output();
         self.update_viewport();
 
-        let always = self
-            .config
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .behavior
-            .always_visible;
-        if always {
-            self.visible = true;
-            self.hide_deadline = None;
+        // Cheap content check first: most niri events (urgency, focus
+        // timestamps, keyboard layout churn) do not change anything we draw,
+        // so they must not cost a layout pass or a redraw.
+        if self.compute_signature() != self.last_sig {
             self.dirty = true;
-        } else if show {
-            self.visible = true;
-            let timeout = self
-                .config
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .behavior
-                .hide_timeout_ms
-                .max(1);
-            self.hide_deadline = Some(Instant::now() + Duration::from_millis(timeout));
-            self.dirty = true;
-        }
-        if self.visible {
             self.update_desired_size();
+            self.pump();
         }
-        self.pump();
     }
 
     fn on_config_reload(&mut self) {
@@ -259,40 +254,9 @@ impl App {
         {
             self.recreate_overlay();
         }
-        if new.behavior.always_visible {
-            self.visible = true;
-            self.hide_deadline = None;
-            self.dirty = true;
-        } else if old.behavior.always_visible {
-            self.hide();
-        }
-        if self.visible {
-            self.update_desired_size();
-        }
+        self.dirty = true;
+        self.update_desired_size();
         self.pump();
-    }
-
-    pub(crate) fn on_hide_tick(&mut self) {
-        if let Some(deadline) = self.hide_deadline {
-            if Instant::now() >= deadline {
-                self.hide();
-            }
-        }
-    }
-
-    fn hide(&mut self) {
-        self.hide_deadline = None;
-        if !self.visible {
-            return;
-        }
-        self.visible = false;
-        self.dirty = false;
-        if let Some(o) = &self.overlay {
-            o.surface.attach(None, 0, 0);
-            o.surface.commit();
-        }
-        self.free_buffers();
-        debug!("minimap hidden");
     }
 
     /// Recreate the layer surface, e.g. when the focused output or the
@@ -307,6 +271,11 @@ impl App {
         self.configured = None;
         self.desired_size = (0, 0);
         self.size_pending = false;
+        self.size_requested = false;
+        // A fresh surface has no buffer yet; the signature check must not
+        // suppress its first draw even if the content is identical.
+        self.surface_generation += 1;
+        self.last_sig = 0;
         self.dirty = true;
 
         let surface = self.compositor.create_surface(&self.qh, ());
@@ -381,6 +350,82 @@ impl App {
         }
     }
 
+    /// Hash of everything that can change the rendered pixels.
+    ///
+    /// The config, the focused output and viewport, the surface generation
+    /// and the rendered workspace/window subset are folded into a 64-bit
+    /// FNV-1a digest. Events that leave it unchanged cannot change the
+    /// output, so the whole layout pass and redraw are skipped.
+    fn compute_signature(&self) -> u64 {
+        let mut h = Fnv1a::new();
+
+        let cfg = self.config.read().unwrap_or_else(|e| e.into_inner());
+        let mode = cfg.display.mode.clone();
+        h.hash(&mode);
+        h.u64(cfg.display.height as u64);
+        h.u64(cfg.display.max_width_percent.to_bits());
+        h.u64(cfg.display.max_height_percent.to_bits());
+        h.u64(cfg.display.follow_focus as u64);
+        h.hash(&cfg.appearance.background);
+        h.u64(cfg.appearance.background_opacity.to_bits());
+        h.hash(&cfg.appearance.window_color);
+        h.hash(&cfg.appearance.focused_color);
+        h.hash(&cfg.appearance.border_color);
+        h.u64(cfg.appearance.border_width.to_bits());
+        h.u64(cfg.appearance.border_radius.to_bits());
+        h.u64(cfg.appearance.gap.to_bits());
+        h.u64(cfg.appearance.window_opacity.to_bits());
+        h.u64(cfg.appearance.focused_opacity.to_bits());
+        h.u64(cfg.appearance.show_icons as u64);
+        h.u64(cfg.appearance.workspace_gap.to_bits());
+        h.hash(&cfg.appearance.active_workspace_border_color);
+        h.u64(cfg.appearance.active_workspace_border_width.to_bits());
+        h.hash(&cfg.appearance.active_window_border_color);
+        h.u64(cfg.appearance.active_window_border_width.to_bits());
+        drop(cfg);
+
+        h.u64(self.surface_generation);
+        h.u64(self.surface_scale as u64);
+        if let Some((w, hh)) = self.configured {
+            h.u64(w as u64);
+            h.u64(hh as u64);
+        }
+        h.hash(self.focused_output_name.as_deref().unwrap_or(""));
+        h.u64(self.viewport_width.to_bits() as u64);
+        h.u64(self.output_height.to_bits() as u64);
+
+        let shared = self.shared.read().unwrap_or_else(|e| e.into_inner());
+        if mode == "all" {
+            for ws in layout::all_rows(&shared.state) {
+                hash_workspace(&mut h, ws);
+            }
+            let mut ids: Vec<u64> = shared.state.windows.windows.keys().copied().collect();
+            ids.sort_unstable();
+            for id in ids {
+                if let Some(w) = shared.state.windows.windows.get(&id) {
+                    hash_window(&mut h, w);
+                }
+            }
+        } else if let Some(ws) = layout::focused_workspace(&shared.state) {
+            hash_workspace(&mut h, ws);
+            let mut ids: Vec<u64> = shared
+                .state
+                .windows
+                .windows
+                .iter()
+                .filter(|(_, w)| w.workspace_id == Some(ws.id))
+                .map(|(id, _)| *id)
+                .collect();
+            ids.sort_unstable();
+            for id in ids {
+                if let Some(w) = shared.state.windows.windows.get(&id) {
+                    hash_window(&mut h, w);
+                }
+            }
+        }
+        h.finish()
+    }
+
     fn focused_output_proxy(&self) -> Option<WlOutput> {
         let name = self.focused_output_name.as_deref();
         if let Some(n) = name {
@@ -440,25 +485,45 @@ impl App {
                 .max(8.0);
             let row_h = (h - 2.0 * render::PADDING - (n - 1.0) * gap) / n;
 
-            let mut global_max = 0.0_f32;
-            let mut max_width = 0.0_f64;
-            for ws in &ws_list {
-                let row = layout::build_row(
-                    ws,
-                    &shared.state.windows.windows,
-                    show_icons.then_some(&self.icons),
-                );
-                if row.has_content() {
-                    global_max = global_max.max(row.max_height as f32);
-                    max_width = max_width.max(row.total_width);
+            let rows: Vec<layout::Row> = ws_list
+                .iter()
+                .map(|ws| {
+                    layout::build_row(
+                        ws,
+                        &shared.state.windows.windows,
+                        show_icons.then_some(&self.icons),
+                    )
+                })
+                .collect();
+
+            // Tiled rows share one scale (tallest tiled column); floating
+            // windows are overlays and never affect the global scaling, so
+            // dragging one does not resize the whole widget.
+            let mut max_tiled_h = 0.0_f32;
+            for row in &rows {
+                if row.has_tiled() {
+                    max_tiled_h = max_tiled_h.max(row.max_height as f32);
                 }
             }
-            let k = if global_max > 0.0 {
-                row_h / global_max
+            let k = if max_tiled_h > 0.0 {
+                row_h / max_tiled_h
             } else {
                 0.0
             };
-            let content_w = max_width as f32 * k;
+            let mut content_w = 0.0_f32;
+            for row in &rows {
+                if !row.has_content() {
+                    continue;
+                }
+                let (rw, rk) = if row.has_tiled() {
+                    (row.total_width, k)
+                } else if row.float_height > 0.0 {
+                    (row.float_width, row_h / row.float_height as f32)
+                } else {
+                    continue;
+                };
+                content_w = content_w.max(rw as f32 * rk);
+            }
             let w = (content_w + 2.0 * render::PADDING)
                 .max(height as f32)
                 .min(max_w);
@@ -473,9 +538,9 @@ impl App {
             });
             let mut w = height as f32;
             if let Some(row) = focused {
-                if row.max_height > 0.0 {
-                    let k = (height as f32 - 2.0 * render::PADDING) / row.max_height as f32;
-                    w = (row.total_width as f32 * k + 2.0 * render::PADDING).max(height as f32);
+                if row.scale_h() > 0.0 {
+                    let k = (height as f32 - 2.0 * render::PADDING) / row.scale_h() as f32;
+                    w = (row.scale_w() as f32 * k + 2.0 * render::PADDING).max(height as f32);
                 }
             }
             (w.min(max_w) as u32, height)
@@ -488,8 +553,12 @@ impl App {
         };
         let (w, h) = self.compute_desired_size();
         let (w, h) = (w.clamp(8, 4096), h.clamp(8, 4096));
-        if (w, h) != self.desired_size {
+        // A fresh layer surface must receive its size before its first
+        // commit, so never skip the initial request even when the dimensions
+        // happen to match.
+        if !self.size_requested || (w, h) != self.desired_size {
             self.desired_size = (w, h);
+            self.size_requested = true;
             self.size_pending = true;
             overlay.layer.set_size(w, h);
             overlay.surface.commit();
@@ -497,23 +566,31 @@ impl App {
     }
 
     /// Redraw now if possible; otherwise wait for the next frame callback,
-    /// configure event or buffer release.
+    /// configure event or buffer release. Redraws whose content is identical
+    /// to the last committed frame are skipped.
     fn pump(&mut self) {
-        if !self.visible || !self.dirty {
+        if !self.dirty {
             return;
         }
         if self.frame_cb.is_some() || self.configured.is_none() || self.size_pending {
             return;
         }
-        self.draw();
-        self.dirty = false;
+        let sig = self.compute_signature();
+        if sig != 0 && sig == self.last_sig {
+            // Nothing the compositor sees would change; drop the redraw.
+            self.dirty = false;
+            return;
+        }
+        self.draw(sig);
     }
 
-    fn draw(&mut self) {
+    fn draw(&mut self, sig: u64) {
         let Some(surface) = self.overlay.as_ref().map(|o| o.surface.clone()) else {
+            self.last_sig = 0;
             return;
         };
         let Some((log_w, log_h)) = self.configured else {
+            self.last_sig = 0;
             return;
         };
         let scale = self.surface_scale.max(1);
@@ -555,7 +632,8 @@ impl App {
             }
         }
 
-        let Some(data) = render::render(
+        if render::render_into(
+            &mut self.render_scratch,
             phys_w,
             phys_h,
             scale as f32,
@@ -565,15 +643,20 @@ impl App {
             &rows,
             &self.icons,
             appearance.show_icons,
-        ) else {
+        )
+        .is_none()
+        {
             warn!("failed to allocate render pixmap");
+            self.last_sig = 0;
             return;
         };
+        self.needed_phys = (phys_w, phys_h);
 
-        if let Some(buf) = self.acquire_buffer(phys_w, phys_h) {
+        if let Some(i) = self.acquire_buffer(phys_w, phys_h) {
             log::debug!("attaching buffer {phys_w}x{phys_h}");
-            let dst = &mut buf.mmap[..data.len()];
-            dst.copy_from_slice(&data);
+            let buf = &mut self.buffers[i];
+            let dst = &mut buf.mmap[..self.render_scratch.len()];
+            dst.copy_from_slice(&self.render_scratch);
             let buffer = buf.buffer.clone();
             surface.attach(Some(&buffer), 0, 0);
             if surface.version() >= 4 {
@@ -584,34 +667,35 @@ impl App {
             let cb = surface.frame(&self.qh, ());
             self.frame_cb = Some(cb);
             surface.commit();
+            self.last_sig = sig;
+            self.dirty = false;
             log::debug!("buffer committed");
         } else {
             // All buffers are with the compositor; stay dirty and let a
             // release event trigger the redraw.
+            self.last_sig = 0;
             self.dirty = true;
         }
     }
 
-    fn acquire_buffer(&mut self, w: u32, h: u32) -> Option<&mut ShmBuffer> {
+    fn acquire_buffer(&mut self, w: u32, h: u32) -> Option<usize> {
         if let Some(i) = self
             .buffers
             .iter()
             .position(|b| !b.in_use && b.w == w && b.h == h)
         {
-            let b = &mut self.buffers[i];
-            b.in_use = true;
-            return Some(b);
+            self.buffers[i].in_use = true;
+            return Some(i);
         }
         if let Some(i) = self.buffers.iter().position(|b| !b.in_use) {
-            let b = &mut self.buffers[i];
-            b.buffer.destroy();
-            b.pool.destroy();
-            let id = b.id;
+            let id = self.buffers[i].id;
+            self.buffers[i].buffer.destroy();
+            self.buffers[i].pool.destroy();
             match ShmBuffer::create(w, h, &self.shm, &self.qh, id) {
                 Ok(nb) => {
-                    *b = nb;
-                    b.in_use = true;
-                    Some(b)
+                    self.buffers[i] = nb;
+                    self.buffers[i].in_use = true;
+                    Some(i)
                 }
                 Err(err) => {
                     warn!("failed to resize shm buffer: {err:#}");
@@ -622,10 +706,11 @@ impl App {
             let id = self.next_buffer_id;
             self.next_buffer_id += 1;
             match ShmBuffer::create(w, h, &self.shm, &self.qh, id) {
-                Ok(mut nb) => {
-                    nb.in_use = true;
+                Ok(nb) => {
                     self.buffers.push(nb);
-                    self.buffers.last_mut()
+                    let i = self.buffers.len() - 1;
+                    self.buffers[i].in_use = true;
+                    Some(i)
                 }
                 Err(err) => {
                     warn!("failed to allocate shm buffer: {err:#}");
@@ -637,10 +722,28 @@ impl App {
         }
     }
 
-    fn free_buffers(&mut self) {
-        for b in self.buffers.drain(..) {
-            b.buffer.destroy();
-            b.pool.destroy();
+    /// Forget buffers that are much larger than the current widget size so a
+    /// shrunken minimap gives its memory back instead of hoarding it.
+    fn reclaim_oversized_buffers(&mut self) {
+        let (nw, nh) = self.needed_phys;
+        let needed_area = (nw as u64) * (nh as u64);
+        if needed_area == 0 {
+            return;
+        }
+        let mut i = 0;
+        while i < self.buffers.len() {
+            let keep = {
+                let b = &self.buffers[i];
+                b.in_use || (b.w as u64) * (b.h as u64) <= needed_area * 2
+            };
+            if keep {
+                i += 1;
+            } else {
+                let b = self.buffers.remove(i);
+                b.buffer.destroy();
+                b.pool.destroy();
+                debug!("reclaimed oversized shm buffer ({}x{})", b.w, b.h);
+            }
         }
     }
 
@@ -648,13 +751,20 @@ impl App {
         self.configured = Some((w.max(1), h.max(1)));
         self.size_pending = false;
         log::debug!("configure received: {w}x{h}");
-        if self.visible {
-            self.dirty = true;
-        }
+        self.dirty = true;
         self.pump();
     }
 
-    fn on_frame_done(&mut self) {
+    fn on_frame_done(&mut self, proxy: &WlCallback) {
+        // Ignore callbacks from surfaces destroyed during a recreate.
+        if self
+            .frame_cb
+            .as_ref()
+            .map(|cb| cb.id() == proxy.id())
+            != Some(true)
+        {
+            return;
+        }
         log::debug!("frame callback done");
         self.frame_cb = None;
         self.pump();
@@ -668,6 +778,7 @@ impl App {
         {
             b.in_use = false;
         }
+        self.reclaim_oversized_buffers();
         if self.dirty {
             self.pump();
         }
@@ -727,10 +838,8 @@ impl Dispatch<wl_output::WlOutput, ()> for App {
                     o.scale = factor;
                 }
                 state.update_surface_scale();
-                if state.visible {
-                    state.dirty = true;
-                    state.pump();
-                }
+                state.dirty = true;
+                state.pump();
             }
             wl_output::Event::Name { name } => {
                 if let Some(o) = state
@@ -795,13 +904,13 @@ impl Dispatch<wl_buffer::WlBuffer, ()> for App {
 impl Dispatch<wl_callback::WlCallback, ()> for App {
     fn event(
         state: &mut Self,
-        _: &WlCallback,
+        proxy: &WlCallback,
         _: wl_callback::Event,
         _: &(),
         _: &wayland_client::Connection,
         _: &QueueHandle<Self>,
     ) {
-        state.on_frame_done();
+        state.on_frame_done(proxy);
     }
 }
 
@@ -820,6 +929,19 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for App {
                 width,
                 height,
             } => {
+                // The configure may belong to a surface we already replaced
+                // after a recreate; ignore stale events so they can neither
+                // clear the new surface's size state nor trigger requests on
+                // a destroyed object.
+                if state
+                    .overlay
+                    .as_ref()
+                    .map(|o| o.layer.id() == proxy.id())
+                    != Some(true)
+                {
+                    debug!("ignoring configure from a stale layer surface");
+                    return;
+                }
                 proxy.ack_configure(serial);
                 state.on_configure(width, height);
             }
@@ -837,6 +959,84 @@ delegate_noop!(App: ignore wl_shm::WlShm);
 delegate_noop!(App: ignore wl_shm_pool::WlShmPool);
 delegate_noop!(App: ignore wl_region::WlRegion);
 delegate_noop!(App: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
+
+/// 64-bit FNV-1a accumulator for the redraw signature.
+struct Fnv1a(u64);
+
+impl Fnv1a {
+    fn new() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+
+    fn byte(&mut self, b: u8) {
+        self.0 ^= b as u64;
+        self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+
+    fn u64(&mut self, v: u64) {
+        for b in v.to_le_bytes() {
+            self.byte(b);
+        }
+    }
+
+    fn hash(&mut self, s: &str) {
+        for b in s.as_bytes() {
+            self.byte(*b);
+        }
+    }
+
+    fn finish(self) -> u64 {
+        self.0
+    }
+}
+
+fn hash_workspace(h: &mut Fnv1a, ws: &niri_ipc::Workspace) {
+    h.u64(ws.id);
+    h.u64(ws.idx as u64);
+    h.hash(ws.name.as_deref().unwrap_or(""));
+    h.hash(ws.output.as_deref().unwrap_or(""));
+    h.u64(ws.is_active as u64);
+    h.u64(ws.is_focused as u64);
+    h.u64(ws.active_window_id.unwrap_or(0));
+}
+
+fn hash_window(h: &mut Fnv1a, w: &niri_ipc::Window) {
+    h.u64(w.id);
+    h.hash(w.app_id.as_deref().unwrap_or(""));
+    h.u64(w.workspace_id.unwrap_or(0));
+    h.u64(w.is_focused as u64);
+    h.u64(w.is_floating as u64);
+    h.u64(
+        w.layout
+            .pos_in_scrolling_layout
+            .map(|p| p.0)
+            .unwrap_or(0) as u64,
+    );
+    h.u64(
+        w.layout
+            .pos_in_scrolling_layout
+            .map(|p| p.1)
+            .unwrap_or(0) as u64,
+    );
+    h.u64(w.layout.tile_size.0.to_bits());
+    h.u64(w.layout.tile_size.1.to_bits());
+    h.u64(w.layout.window_size.0 as u64);
+    h.u64(w.layout.window_size.1 as u64);
+    h.u64(
+        w.layout
+            .tile_pos_in_workspace_view
+            .map(|p| p.0.to_bits())
+            .unwrap_or(0),
+    );
+    h.u64(
+        w.layout
+            .tile_pos_in_workspace_view
+            .map(|p| p.1.to_bits())
+            .unwrap_or(0),
+    );
+    h.u64(w.layout.window_offset_in_tile.0.to_bits());
+    h.u64(w.layout.window_offset_in_tile.1.to_bits());
+}
 
 fn anchor_bits(anchor: &str) -> Anchor {
     use Anchor as A;

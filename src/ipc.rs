@@ -13,14 +13,13 @@ use niri_ipc::socket::Socket;
 use niri_ipc::state::{EventStreamState, EventStreamStatePart};
 use niri_ipc::{Event, Request, Response};
 
-use crate::config::Config;
 use crate::icons::{self, SharedIcons};
 
 /// Messages sent from helper threads to the UI event loop.
 #[derive(Debug, Clone, Copy)]
 pub enum UiMsg {
-    /// Niri state changed; `show` requests the transient minimap pop-up.
-    StateChanged { show: bool },
+    /// The niri state changed in a way that can affect the minimap.
+    StateChanged,
     /// The config file changed.
     ConfigReload,
 }
@@ -38,14 +37,13 @@ pub type Shared = Arc<RwLock<Snapshot>>;
 /// Spawn the IPC thread. It reconnects automatically if niri restarts.
 pub fn spawn_ipc_thread(
     shared: Shared,
-    config: Arc<RwLock<Config>>,
     tx: Sender<UiMsg>,
     icons: SharedIcons,
 ) -> Result<()> {
     thread::Builder::new()
         .name("nirimap-ipc".into())
         .spawn(move || {
-            while let Err(err) = ipc_loop(&shared, &config, &tx, &icons) {
+            while let Err(err) = ipc_loop(&shared, &tx, &icons) {
                 warn!("niri IPC connection lost: {err:#}; reconnecting in 2s...");
                 thread::sleep(Duration::from_secs(2));
             }
@@ -53,12 +51,7 @@ pub fn spawn_ipc_thread(
     Ok(())
 }
 
-fn ipc_loop(
-    shared: &Shared,
-    config: &Arc<RwLock<Config>>,
-    tx: &Sender<UiMsg>,
-    icons: &SharedIcons,
-) -> Result<()> {
+fn ipc_loop(shared: &Shared, tx: &Sender<UiMsg>, icons: &SharedIcons) -> Result<()> {
     let mut socket =
         Socket::connect().context("failed to connect to the niri IPC socket (is niri running?)")?;
 
@@ -104,7 +97,7 @@ fn ipc_loop(
             snap.outputs.len()
         );
     }
-    tx.send(UiMsg::StateChanged { show: true }).ok();
+    tx.send(UiMsg::StateChanged).ok();
     debug!("connected to niri; snapshot loaded");
 
     match socket.send(Request::EventStream)? {
@@ -121,31 +114,33 @@ fn ipc_loop(
                 icons::has_icon(icons, app_id);
             }
         }
-        let show = {
+        let affects_render = event_affects_render(&event);
+        {
             let mut snap = shared.write().unwrap_or_else(|e| e.into_inner());
-            let cfg = config.read().unwrap_or_else(|e| e.into_inner());
-            let show = should_show(&event, &snap.state, &cfg);
             snap.state.apply(event);
-            show
-        };
-        tx.send(UiMsg::StateChanged { show }).ok();
+        }
+        // Only wake the UI thread when the minimap's rendered content can
+        // actually change; the rest of the state is still applied above so it
+        // stays consistent.
+        if affects_render {
+            tx.send(UiMsg::StateChanged).ok();
+        }
     }
 }
 
-/// Decide whether this event should pop the transient minimap up.
-fn should_show(event: &Event, state: &EventStreamState, config: &Config) -> bool {
-    if config.behavior.always_visible || config.behavior.show_for_floating_windows {
-        return true;
-    }
-    match event {
-        Event::WindowOpenedOrChanged { window } => !window.is_floating,
-        Event::WindowFocusChanged { id: Some(id) } => state
-            .windows
-            .windows
-            .get(id)
-            .map(|w| !w.is_floating)
-            .unwrap_or(true),
-        Event::WindowFocusChanged { id: None } => true,
-        _ => true,
-    }
+/// True when an event can change what the minimap draws (windows, workspaces
+/// or outputs). Urgency, focus timestamps, keyboard layouts, screencasts and
+/// similar events only update bookkeeping and must not trigger a redraw.
+fn event_affects_render(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::WorkspacesChanged { .. }
+            | Event::WorkspaceActivated { .. }
+            | Event::WorkspaceActiveWindowChanged { .. }
+            | Event::WindowsChanged { .. }
+            | Event::WindowOpenedOrChanged { .. }
+            | Event::WindowClosed { .. }
+            | Event::WindowFocusChanged { .. }
+            | Event::WindowLayoutsChanged { .. }
+    )
 }
